@@ -1,16 +1,16 @@
 //! Module for serializing / deserializing rows
 
 /// Enum to represent possible dtypes in a table
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum DataType {
-    Varchar(usize),
+    Char(usize),
     Int,
 }
 
 /// Enum to represent Rust values from table dtypes
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum DataValue {
-    Varchar(String),
+    Char(String),
     Int(u64),
 }
 
@@ -52,7 +52,7 @@ impl DataType {
     fn deserialize(self, bytes: &mut ByteStream) -> Result<DataValue, DeserializationError> {
         use DeserializationError::*;
         match self {
-            Self::Varchar(x) => Ok(DataValue::Varchar(
+            Self::Char(x) => Ok(DataValue::Char(
                 str::from_utf8(bytes.next(x))
                     .map_err(|e| StringDeserializeError(e.to_string()))?
                     .to_owned(),
@@ -79,10 +79,17 @@ impl DataValue {
                 buffer.extend_from_slice(slice);
                 Ok(())
             }
-            Self::Varchar(s) => {
+            Self::Char(s) => {
                 buffer.extend_from_slice(s.as_bytes());
                 Ok(())
             }
+        }
+    }
+
+    fn to_type(&self) -> DataType {
+        match self {
+            Self::Int(_) => DataType::Int,
+            Self::Char(x) => DataType::Char(x.len()),
         }
     }
 }
@@ -123,24 +130,46 @@ mod tests {
 
     use crate::serialization::{ByteStream, DataType, DataValue, Deserializer, Serializer};
 
-    // macro_rules! test_dummy {
-    //     () => {};
-    // }
+    macro_rules! test_round_trip {
+        ($($val:expr),+ $(,)?) => {
+            {
+                let values = vec![$($val),+];
+                let mut buffer = Vec::<u8>::new();
+                let _ = Serializer {}.serialize(&mut buffer, values.clone()).unwrap();
+
+                let mut stream = ByteStream {
+                    bytes: &buffer,
+                    position: 0,
+                    length: 0,
+                };
+                let dtypes = values.iter().map(|v| v.to_type()).collect();
+                let deserialized = Deserializer {}.deserialize(&mut stream, dtypes).unwrap();
+                println!("{:?}", deserialized);
+                assert_eq!(values, deserialized)
+            }
+        };
+    }
 
     #[test]
-    fn test_row() {
-        let values = vec![DataValue::Int(5), DataValue::Int(10)];
-        let mut buffer = Vec::<u8>::new();
-        let _ = Serializer {}.serialize(&mut buffer, values).unwrap();
+    fn test_ints() {
+        test_round_trip![DataValue::Int(5), DataValue::Int(10)]
+    }
 
-        let mut stream = ByteStream {
-            bytes: &buffer,
-            position: 0,
-            length: 0,
-        };
-        let dtypes = vec![DataType::Int, DataType::Int];
-        let deserialized = Deserializer {}.deserialize(&mut stream, dtypes).unwrap();
-        println!("{:?}", deserialized);
-        assert_eq!(vec![DataValue::Int(5), DataValue::Int(10)], deserialized)
+    #[test]
+    fn test_chars() {
+        test_round_trip![
+            DataValue::Char("test".to_string()),
+            DataValue::Char("my_char".to_string())
+        ]
+    }
+
+    #[test]
+    fn test_mix() {
+        test_round_trip![
+            DataValue::Int(5),
+            DataValue::Char("test".to_string()),
+            DataValue::Int(10),
+            DataValue::Char("my_char".to_string())
+        ]
     }
 }
