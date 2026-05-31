@@ -1,14 +1,14 @@
 //! Module for serializing / deserializing rows
 
 /// Enum to represent possible dtypes in a table
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum DataType {
     Varchar(usize),
     Int,
 }
 
 /// Enum to represent Rust values from table dtypes
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum DataValue {
     Varchar(String),
     Int(u64),
@@ -34,17 +34,23 @@ impl<'a> ByteStream<'a> {
 }
 
 #[derive(thiserror::Error, Debug)]
-enum DeserializeError {
+enum DeserializationError {
     #[error("Error deserializing string: {0}")]
     StringDeserializeError(String),
     #[error("Error deserializing int: {0}")]
     IntDeserializeError(String),
 }
 
+#[derive(thiserror::Error, Debug)]
+enum SerializtionError {
+    #[error("Error serializing: {0}")]
+    SerializtionError(String),
+}
+
 impl DataType {
     /// deserialize a datatype byte stream to a DataValue
-    fn deserialize(self, bytes: &mut ByteStream) -> Result<DataValue, DeserializeError> {
-        use DeserializeError::*;
+    fn deserialize(self, bytes: &mut ByteStream) -> Result<DataValue, DeserializationError> {
+        use DeserializationError::*;
         match self {
             Self::Varchar(x) => Ok(DataValue::Varchar(
                 str::from_utf8(bytes.next(x))
@@ -65,7 +71,7 @@ impl DataType {
 
 impl DataValue {
     /// Serialize a Rust value to a byte stream DataType
-    fn serialize(self, buffer: &mut Vec<u8>) -> Result<(), String> {
+    fn serialize(self, buffer: &mut Vec<u8>) -> Result<(), SerializtionError> {
         match self {
             Self::Int(x) => {
                 let bytes: [u8; 8] = x.to_be_bytes();
@@ -81,11 +87,60 @@ impl DataValue {
     }
 }
 
+///
+#[derive(Debug)]
+pub struct Serializer {}
+
+impl Serializer {
+    fn serialize(
+        &self,
+        buffer: &mut Vec<u8>,
+        values: Vec<DataValue>,
+    ) -> Result<(), SerializtionError> {
+        for value in values.into_iter() {
+            value.serialize(buffer)?
+        }
+        Ok(())
+    }
+}
+
+///
+#[derive(Debug)]
+pub struct Deserializer {}
+
+impl Deserializer {
+    fn deserialize(
+        &self,
+        stream: &mut ByteStream,
+        dtypes: Vec<DataType>,
+    ) -> Result<Vec<DataValue>, DeserializationError> {
+        dtypes.into_iter().map(|d| d.deserialize(stream)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    macro_rules! test_dummy {
-        () => {};
-    }
 
-    fn test_string() {}
+    use crate::serialization::{ByteStream, DataType, DataValue, Deserializer, Serializer};
+
+    // macro_rules! test_dummy {
+    //     () => {};
+    // }
+
+    #[test]
+    fn test_row() {
+        let values = vec![DataValue::Int(5), DataValue::Int(10)];
+        let mut buffer = Vec::<u8>::new();
+        let _ = Serializer {}.serialize(&mut buffer, values).unwrap();
+
+        let mut stream = ByteStream {
+            bytes: &buffer,
+            position: 0,
+            length: 0,
+        };
+        let dtypes = vec![DataType::Int, DataType::Int];
+        let deserialized = Deserializer {}.deserialize(&mut stream, dtypes).unwrap();
+        println!("{:?}", deserialized);
+        assert_eq!(vec![DataValue::Int(5), DataValue::Int(10)], deserialized)
+    }
 }
