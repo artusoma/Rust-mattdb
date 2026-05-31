@@ -1,5 +1,7 @@
 //! Module for serializing / deserializing rows
 
+use std::fmt::Write;
+
 /// Errors while performing data deserialization
 #[derive(thiserror::Error, Debug, PartialEq, PartialOrd)]
 enum DeserializationError {
@@ -20,20 +22,62 @@ enum SerializationError {
     StringOverflow(usize, usize),
     #[error("Mismatched types: got type {0} and value {1}")]
     TypeMismatch(DataType, DataValue),
+    #[error("Unexpected end to buffer while writing")]
+    BufferUnexpectedEnd,
+}
+
+/// Stream of bytes to be used in Serializer
+#[derive(Debug)]
+struct WriteByteStream {
+    buffer: Vec<u8>,
+    position: usize,
+    length: usize,
+}
+
+impl WriteByteStream {
+    fn new(size: usize) -> Self {
+        WriteByteStream {
+            buffer: vec![0u8; size],
+            position: 0,
+            length: size,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), SerializationError> {
+        let start = self.position;
+        let end = start + bytes.len();
+        self.position += bytes.len();
+
+        if end > self.length {
+            Err(SerializationError::BufferUnexpectedEnd)
+        } else {
+            self.buffer[start..end].copy_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    fn pad(&mut self, padding: usize) -> Result<(), SerializationError> {
+        self.position += padding;
+        if self.position > self.length {
+            Err(SerializationError::BufferUnexpectedEnd)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Stream of bytes to be used in Deserializer
 #[derive(Debug)]
-struct ByteStream<'a> {
+struct ReadByteStream<'a> {
     bytes: &'a [u8],
     position: usize,
     length: usize,
 }
 
-impl<'a> ByteStream<'a> {
+impl<'a> ReadByteStream<'a> {
     /// Get next `len` bytes from data and advance the position, checking
     /// if we are out of bounds to prevent a panic!
-    fn next(&mut self, len: usize) -> Result<&[u8], DeserializationError> {
+    fn read(&mut self, len: usize) -> Result<&[u8], DeserializationError> {
         let start = self.position;
         let end = start + len;
         self.position += len;
@@ -81,18 +125,18 @@ pub enum DataType {
 
 impl DataType {
     /// deserialize a datatype byte stream to a DataValue
-    fn deserialize(&self, bytes: &mut ByteStream) -> Result<DataValue, DeserializationError> {
+    fn deserialize(&self, stream: &mut ReadByteStream) -> Result<DataValue, DeserializationError> {
         use DeserializationError::*;
+        let bytes = stream.read(self.size())?;
         match self {
             Self::Char(x) => Ok(DataValue::Char(
-                str::from_utf8(bytes.next(*x)?)
+                str::from_utf8(bytes)
                     .map_err(|e| StringDeserializeError(e.to_string()))?
                     .trim_end_matches('\0')
                     .to_owned(),
             )),
             Self::Int => Ok(DataValue::Int(u64::from_be_bytes(
                 bytes
-                    .next(8)?
                     .try_into()
                     .map_err(|e: std::array::TryFromSliceError| {
                         IntDeserializeError(e.to_string())
@@ -103,7 +147,7 @@ impl DataType {
 
     fn serialize(
         &self,
-        buffer: &mut Vec<u8>,
+        buffer: &mut WriteByteStream,
         data_value: &DataValue,
     ) -> Result<(), SerializationError> {
         use SerializationError::*;
@@ -111,19 +155,26 @@ impl DataType {
             (DataType::Int, DataValue::Int(x)) => {
                 let bytes: [u8; 8] = x.to_be_bytes();
                 let slice: &[u8] = &bytes;
-                buffer.extend_from_slice(slice);
+                buffer.write(slice)?;
                 Ok(())
             }
             (DataType::Char(size), DataValue::Char(s)) => {
                 if s.len() > *size {
                     Err(StringOverflow(*size, s.len()))
                 } else {
-                    buffer.extend_from_slice(s.as_bytes());
-                    buffer.resize(buffer.len() + (*size - s.len()), 0u8);
+                    buffer.write(s.as_bytes())?;
+                    buffer.pad(*size - s.len())?;
                     Ok(())
                 }
             }
             (data_type, data_value) => Err(TypeMismatch(data_type.clone(), data_value.clone())),
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            Self::Char(n) => *n,
+            Self::Int => 8,
         }
     }
 }
@@ -144,14 +195,15 @@ pub struct Serializer {}
 impl Serializer {
     fn serialize(
         &self,
-        buffer: &mut Vec<u8>,
         dtypes: Vec<DataType>,
         values: Vec<DataValue>,
-    ) -> Result<(), SerializationError> {
+    ) -> Result<Vec<u8>, SerializationError> {
+        let capacity: usize = dtypes.iter().map(|d| d.size()).sum();
+        let mut write_stream = WriteByteStream::new(capacity);
         for (dtype, value) in dtypes.iter().zip(values.iter()) {
-            dtype.serialize(buffer, value)?;
+            dtype.serialize(&mut write_stream, value)?;
         }
-        Ok(())
+        Ok(write_stream.buffer)
     }
 }
 
@@ -168,7 +220,7 @@ pub struct Deserializer {}
 impl Deserializer {
     fn deserialize(
         &self,
-        stream: &mut ByteStream,
+        stream: &mut ReadByteStream,
         dtypes: Vec<DataType>,
     ) -> Result<Vec<DataValue>, DeserializationError> {
         dtypes.into_iter().map(|d| d.deserialize(stream)).collect()
@@ -184,17 +236,18 @@ impl Default for Deserializer {
 #[cfg(test)]
 mod tests {
 
-    use crate::serialization::{ByteStream, DataType, DataValue, Deserializer, SerializationError, Serializer};
+    use crate::serialization::{
+        DataType, DataValue, Deserializer, ReadByteStream, SerializationError, Serializer,
+    };
 
     macro_rules! test_round_trip {
         ($($val:expr),+ $(,)?; $($type:expr),+ $(,)?) => {
             {
                 let values = vec![$($val),+];
                 let types = vec![$($type),+];
-                let mut buffer = Vec::<u8>::new();
-                let _ = Serializer::default().serialize(&mut buffer, types.clone(), values.clone()).unwrap();
+                let serialized = Serializer::default().serialize(types.clone(), values.clone()).unwrap();
 
-                let mut stream = ByteStream::new(&buffer);
+                let mut stream = ReadByteStream::new(&serialized);
                 let deserialized = Deserializer::default().deserialize(&mut stream, types).unwrap();
                 println!("{:?}", deserialized);
                 assert_eq!(values, deserialized)
@@ -234,7 +287,10 @@ mod tests {
     #[test]
     fn raises_string_overflow() {
         let mut stream = Vec::<u8>::new();
-        let res = Serializer::default().serialize(&mut stream, vec![DataType::Char(3)], vec![DataValue::Char("overflow".to_string())]);
+        let res = Serializer::default().serialize(
+            vec![DataType::Char(3)],
+            vec![DataValue::Char("overflow".to_string())],
+        );
         assert_eq!(res, Err(SerializationError::StringOverflow(3, 8)))
     }
 }
