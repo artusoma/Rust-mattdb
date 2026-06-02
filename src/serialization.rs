@@ -124,7 +124,7 @@ pub enum DataType {
 }
 
 impl DataType {
-    /// deserialize a datatype byte stream to a DataValue
+    /// Deserialize a byte stream to a DataValue
     fn deserialize(&self, stream: &mut ReadByteStream) -> Result<DataValue, DeserializationError> {
         use DeserializationError::*;
         let bytes = stream.read(self.size())?;
@@ -145,9 +145,10 @@ impl DataType {
         }
     }
 
+    /// Serializes a value to the stream from this type
     fn serialize(
         &self,
-        buffer: &mut WriteByteStream,
+        stream: &mut WriteByteStream,
         data_value: &DataValue,
     ) -> Result<(), SerializationError> {
         use SerializationError::*;
@@ -155,15 +156,15 @@ impl DataType {
             (DataType::Int, DataValue::Int(x)) => {
                 let bytes: [u8; 8] = x.to_be_bytes();
                 let slice: &[u8] = &bytes;
-                buffer.write(slice)?;
+                stream.write(slice)?;
                 Ok(())
             }
             (DataType::Char(size), DataValue::Char(s)) => {
                 if s.len() > *size {
                     Err(StringOverflow(*size, s.len()))
                 } else {
-                    buffer.write(s.as_bytes())?;
-                    buffer.pad(*size - s.len())?;
+                    stream.write(s.as_bytes())?;
+                    stream.pad(*size - s.len())?;
                     Ok(())
                 }
             }
@@ -171,6 +172,7 @@ impl DataType {
         }
     }
 
+    /// Retreives the size of an element in bytes
     fn size(&self) -> usize {
         match self {
             Self::Char(n) => *n,
@@ -195,8 +197,8 @@ pub struct Serializer {}
 impl Serializer {
     fn serialize(
         &self,
-        dtypes: Vec<DataType>,
-        values: Vec<DataValue>,
+        dtypes: &Vec<DataType>,
+        values: &Vec<DataValue>,
     ) -> Result<Vec<u8>, SerializationError> {
         let capacity: usize = dtypes.iter().map(|d| d.size()).sum();
         let mut write_stream = WriteByteStream::new(capacity);
@@ -245,7 +247,7 @@ mod tests {
             {
                 let values = vec![$($val),+];
                 let types = vec![$($type),+];
-                let serialized = Serializer::default().serialize(types.clone(), values.clone()).unwrap();
+                let serialized = Serializer::default().serialize(&types, &values).unwrap();
 
                 let mut stream = ReadByteStream::new(&serialized);
                 let deserialized = Deserializer::default().deserialize(&mut stream, types).unwrap();
@@ -288,8 +290,8 @@ mod tests {
     fn raises_string_overflow() {
         let mut stream = Vec::<u8>::new();
         let res = Serializer::default().serialize(
-            vec![DataType::Char(3)],
-            vec![DataValue::Char("overflow".to_string())],
+            &vec![DataType::Char(3)],
+            &vec![DataValue::Char("overflow".to_string())],
         );
         assert_eq!(res, Err(SerializationError::StringOverflow(3, 8)))
     }
