@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, RwLock, RwLockWriteGuard},
+    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard},
     thread::LocalKey,
 };
 
@@ -62,6 +62,42 @@ impl Deref for PageRef {
 
 impl PageRef {}
 
+/// EvictManager handles evictions
+#[derive(Debug)]
+struct EvictManager {
+    /// Queue of page_ids to evict
+    evict_queue: Mutex<Vec<u64>>,
+}
+
+impl EvictManager {
+    fn new() -> Self {
+        Self {
+            evict_queue: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn queue(&self) -> MutexGuard<Vec<u64>> {
+        self.evict_queue.lock().unwrap()
+    }
+
+    fn add_to_queue(&self, page_id: u64) {
+        let queue = self.queue();
+        if queue.contains(&page_id) {
+            self.queue().push(page_id)
+        }
+    }
+
+    fn remove_from_queue(&self, page_id: u64) {
+        let mut queue = self.queue();
+        if let Some(idx) = queue.iter().position(|idx| *idx == page_id) {
+            queue.remove(idx);
+        }
+    }
+
+    fn victim(&self) -> u64 {
+        self.queue().remove(0)
+    }
+}
 
 /// Only way to rest of program to interact with pages.
 /// Rest of matt-db cannot talk to disk -- it must talk to BufferPool.
@@ -73,7 +109,7 @@ pub struct BufferPool {
     pages: Vec<RwLock<Page>>, // this stays fixed -- no need for a Mutex on `pages` (the Vec) itself. Could be a "boxed slice"
     id_to_idx: RwLock<HashMap<u64, usize>>,
     /// Least recently used tracker
-    lru: RwLock<Vec<usize>>,
+    evict_manager: EvictManager,
 }
 
 impl BufferPool {
@@ -83,7 +119,7 @@ impl BufferPool {
                 .take(PAGES_IN_MEMORY)
                 .collect(),
             id_to_idx: RwLock::new(HashMap::new()),
-            lru: RwLock::new((1..PAGES_IN_MEMORY).into_iter().collect()),
+            evict_manager: EvictManager::new(),
         }
     }
 
@@ -101,6 +137,9 @@ impl BufferPool {
             .as_mut()
         {
             *x -= 1;
+            if *x == 0 {
+                self.evict_manager.add_to_queue(page_id)
+            }
         }
     }
 
@@ -113,6 +152,9 @@ impl BufferPool {
             .as_mut()
         {
             *x += 1;
+            if *x == 1 {
+                self.evict_manager.remove_from_queue(page_id);
+            }
         }
     }
 
