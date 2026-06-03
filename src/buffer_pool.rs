@@ -6,15 +6,37 @@ use std::{
 };
 
 const PAGE_SIZE: usize = 8192;
+const PAGES_IN_MEMORY: usize = 1000;
 
 #[derive(Debug)]
 pub struct Page {
-    page_id: u64,
+    page_id: Option<u64>,
     content: [u8; PAGE_SIZE],
-    pins: u64,
+    pins: Option<u64>,
     is_dirty: bool,
 }
 
+impl Default for Page {
+    fn default() -> Self {
+        Page {
+            page_id: None, 
+            content: [0; PAGE_SIZE],
+            pins: None,
+            is_dirty: false
+        }
+    }
+}
+
+impl Page {
+    fn load_new(&mut self, page_id: u64, content: [u8; PAGE_SIZE]) {
+        self.content = content;
+        self.page_id = Some(page_id);
+        self.is_dirty = false;
+        self.pins = Some(0);
+    }
+}
+
+/// Fat pointer to BufferPool with page id to be referenced attached
 pub struct PageRef {
     pool: Arc<BufferPool>,
     page_id: u64,
@@ -42,11 +64,14 @@ impl PageRef {}
 
 /// Only way to rest of program to interact with pages.
 /// Rest of matt-db cannot talk to disk -- it must talk to BufferPool.
+/// 
+/// Should be wrapped in an Arc
 #[derive(Debug)]
 pub struct BufferPool {
+    // 
     pages: Vec<RwLock<Page>>, // this stays fixed -- no need for a Mutex on `pages` (the Vec) itself. Could be a "boxed slice"
     page_lookup: RwLock<HashMap<u64, usize>>,
-    used_timer: RwLock<Vec<usize>>,
+    use_order: Vec<RwLock<usize>>, // -1 indicates empty
 }
 
 impl BufferPool {
@@ -54,9 +79,13 @@ impl BufferPool {
         todo!()
     }
 
-    fn unpin(&self, page_id: u64) {
+    fn get_in_memory_page(&self, page_id: u64) -> &RwLock<Page> {
         let page_idx = self.lookup_page_idx(page_id);
-        self.pages.get(page_idx).unwrap().write().unwrap().pins -= 1;
+        self.pages.get(page_idx).unwrap()
+    }
+
+    fn unpin(&self, page_id: u64) {
+        self.get_in_memory_page(page_id).write().unwrap().pins -= 1
     }
 
     /// Only let people call this when managed by an Arc
