@@ -74,8 +74,6 @@ struct EvictManager {
     evict_queue: Mutex<VecDeque<Frame>>,
     /// Stack of unused frames
     unused_frames: Mutex<Vec<Frame>>,
-    /// Quick bool to check if any more unused frames
-    unused_available: RwLock<bool>,
 }
 
 impl EvictManager {
@@ -83,7 +81,6 @@ impl EvictManager {
         Self {
             evict_queue: Mutex::new(VecDeque::new()),
             unused_frames: Mutex::new((0..size).collect()),
-            unused_available: RwLock::new(true),
         }
     }
 
@@ -93,7 +90,7 @@ impl EvictManager {
 
     fn add_to_queue(&self, frame: Frame) {
         let mut queue = self.queue();
-        if !queue.contains(&frame) {
+        if queue.contains(&frame) {
             queue.push_back(frame)
         }
     }
@@ -106,13 +103,9 @@ impl EvictManager {
     }
 
     fn victim(&self) -> Option<Frame> {
-        // Check if we have anything unused. 
-        if *self.unused_available.read().unwrap() {
-            if let Some(frame) = self.unused_frames.lock().unwrap().pop() {
-                return Some(frame);
-            } else {
-                *self.unused_available.write().unwrap() = false
-            }
+        // Check if we have anything unused.
+        if let Some(frame) = self.unused_frames.lock().unwrap().pop() {
+            return Some(frame);
         }
         self.queue().pop_front()
     }
