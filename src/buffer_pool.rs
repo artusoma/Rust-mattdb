@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    ffi::FromBytesUntilNulError,
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard},
     thread::LocalKey,
@@ -8,11 +9,15 @@ use std::{
 const PAGE_SIZE: usize = 8192;
 const PAGES_IN_MEMORY: usize = 1000;
 
+// Types because I keep getting confused
+type PageID = u64;
+type Frame = usize;
+
 #[derive(Debug, Clone)]
 pub struct Page {
-    page_id: Option<u64>,
+    page_id: Option<PageID>,
     content: [u8; PAGE_SIZE],
-    pins: Option<u64>,
+    pins: u64,
     is_dirty: bool,
 }
 
@@ -21,25 +26,25 @@ impl Default for Page {
         Page {
             page_id: None,
             content: [0; PAGE_SIZE],
-            pins: None,
+            pins: 0,
             is_dirty: false,
         }
     }
 }
 
 impl Page {
-    fn load_new(&mut self, page_id: u64, content: [u8; PAGE_SIZE]) {
+    fn load_new(&mut self, page_id: PageID, content: [u8; PAGE_SIZE]) {
         self.content = content;
         self.page_id = Some(page_id);
         self.is_dirty = false;
-        self.pins = Some(0);
+        self.pins = 0;
     }
 }
 
 /// Fat pointer to BufferPool with page id to be referenced attached
 pub struct PageRef {
     pool: Arc<BufferPool>,
-    page_id: u64,
+    page_id: PageID,
 }
 
 /// When PageRef is dropped, decrement the page's pin count
@@ -65,37 +70,51 @@ impl PageRef {}
 /// EvictManager handles evictions
 #[derive(Debug)]
 struct EvictManager {
-    /// Queue of page_ids to evict
-    evict_queue: Mutex<Vec<u64>>,
+    /// Queue of frames to evict
+    evict_queue: Mutex<VecDeque<Frame>>,
+    /// Stack of unused frames
+    unused_frames: Mutex<Vec<Frame>>,
+    /// Quick bool to check if any more unused frames
+    unused_available: RwLock<bool>,
 }
 
 impl EvictManager {
-    fn new() -> Self {
+    fn new(size: usize) -> Self {
         Self {
-            evict_queue: Mutex::new(Vec::new()),
+            evict_queue: Mutex::new(VecDeque::new()),
+            unused_frames: Mutex::new((0..size).collect()),
+            unused_available: RwLock::new(true),
         }
     }
 
-    fn queue(&self) -> MutexGuard<Vec<u64>> {
+    fn queue(&self) -> MutexGuard<VecDeque<Frame>> {
         self.evict_queue.lock().unwrap()
     }
 
-    fn add_to_queue(&self, page_id: u64) {
-        let queue = self.queue();
-        if queue.contains(&page_id) {
-            self.queue().push(page_id)
+    fn add_to_queue(&self, frame: Frame) {
+        let mut queue = self.queue();
+        if !queue.contains(&frame) {
+            queue.push_back(frame)
         }
     }
 
-    fn remove_from_queue(&self, page_id: u64) {
+    fn remove_from_queue(&self, frame: Frame) {
         let mut queue = self.queue();
-        if let Some(idx) = queue.iter().position(|idx| *idx == page_id) {
+        if let Some(idx) = queue.iter().position(|idx| *idx == frame) {
             queue.remove(idx);
         }
     }
 
-    fn victim(&self) -> u64 {
-        self.queue().remove(0)
+    fn victim(&self) -> Option<Frame> {
+        // Check if we have anything unused. 
+        if *self.unused_available.read().unwrap() {
+            if let Some(frame) = self.unused_frames.lock().unwrap().pop() {
+                return Some(frame);
+            } else {
+                *self.unused_available.write().unwrap() = false
+            }
+        }
+        self.queue().pop_front()
     }
 }
 
@@ -105,11 +124,13 @@ impl EvictManager {
 /// Should be wrapped in an Arc
 #[derive(Debug)]
 pub struct BufferPool {
-    //
-    pages: Vec<RwLock<Page>>, // this stays fixed -- no need for a Mutex on `pages` (the Vec) itself. Could be a "boxed slice"
+    /// this stays fixed -- no need for a Mutex on `pages` (the Vec) itself. Could be a "boxed slice"
+    pages: Vec<RwLock<Page>>,
     id_to_idx: RwLock<HashMap<u64, usize>>,
     /// Least recently used tracker
     evict_manager: EvictManager,
+    /// Unused frames
+    unused_frames: Mutex<Vec<usize>>,
 }
 
 impl BufferPool {
@@ -120,6 +141,7 @@ impl BufferPool {
                 .collect(),
             id_to_idx: RwLock::new(HashMap::new()),
             evict_manager: EvictManager::new(),
+            unused_frames: Mutex::new((0..PAGES_IN_MEMORY).collect()),
         }
     }
 
@@ -129,32 +151,19 @@ impl BufferPool {
     }
 
     fn unpin(&self, page_id: u64) {
-        if let Some(x) = self
-            .get_in_memory_page(page_id)
-            .write()
-            .unwrap()
-            .pins
-            .as_mut()
-        {
-            *x -= 1;
-            if *x == 0 {
-                self.evict_manager.add_to_queue(page_id)
-            }
+        // Why not auto mut like in function signature?
+        let mut page = self.get_in_memory_page(page_id).write().unwrap();
+        page.pins -= 1;
+        if page.pins == 0 {
+            self.evict_manager.add_to_queue(page_id)
         }
     }
 
     fn pin(&self, page_id: u64) {
-        if let Some(x) = self
-            .get_in_memory_page(page_id)
-            .write()
-            .unwrap()
-            .pins
-            .as_mut()
-        {
-            *x += 1;
-            if *x == 1 {
-                self.evict_manager.remove_from_queue(page_id);
-            }
+        let mut page = self.get_in_memory_page(page_id).write().unwrap();
+        page.pins += 1;
+        if page.pins == 1 {
+            self.evict_manager.remove_from_queue(page_id);
         }
     }
 
