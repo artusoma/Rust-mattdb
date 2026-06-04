@@ -1,9 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
-    ffi::FromBytesUntilNulError,
-    ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard},
-    thread::LocalKey,
+    collections::{HashMap, VecDeque}, ffi::{FromBytesUntilNulError, FromVecWithNulError}, ops::{Deref, DerefMut}, path::PathBuf, sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard}, thread::LocalKey
 };
 
 const PAGE_SIZE: usize = 8192;
@@ -58,14 +54,9 @@ impl Deref for PageRef {
     type Target = RwLock<Page>;
 
     fn deref(&self) -> &Self::Target {
-        self.pool
-            .pages
-            .get(self.pool.idx_from_page_id(self.page_id))
-            .unwrap()
+        self.pool.pages.get(self.pool.frame(self.page_id)).unwrap()
     }
 }
-
-impl PageRef {}
 
 /// EvictManager handles evictions
 #[derive(Debug)]
@@ -111,6 +102,30 @@ impl EvictManager {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum BufferPoolError {
+    #[error("No frames available to evict in buffer.")]
+    NoFreeFrames,
+}
+
+struct DiskIO {
+    file: PathBuf
+}
+
+impl DiskIO {
+    fn write_page(&self, page_id: PageID, content: [u8; PAGE_SIZE]) {
+
+    }
+
+    fn read_page(&self, page_id: PageID) -> [u8; PAGE_SIZE] {
+        todo!()
+    }
+
+    fn page_offset(&self, page_id: PageID) -> u8 {
+        todo!()
+    }
+}
+
 /// Only way to rest of program to interact with pages.
 /// Rest of matt-db cannot talk to disk -- it must talk to BufferPool.
 ///
@@ -119,11 +134,9 @@ impl EvictManager {
 pub struct BufferPool {
     /// this stays fixed -- no need for a Mutex on `pages` (the Vec) itself. Could be a "boxed slice"
     pages: Vec<RwLock<Page>>,
-    id_to_idx: RwLock<HashMap<u64, usize>>,
+    page_to_frame: RwLock<HashMap<PageID, Frame>>,
     /// Least recently used tracker
     evict_manager: EvictManager,
-    /// Unused frames
-    unused_frames: Mutex<Vec<usize>>,
 }
 
 impl BufferPool {
@@ -132,38 +145,37 @@ impl BufferPool {
             pages: std::iter::repeat_with(|| RwLock::new(Page::default()))
                 .take(PAGES_IN_MEMORY)
                 .collect(),
-            id_to_idx: RwLock::new(HashMap::new()),
-            evict_manager: EvictManager::new(),
-            unused_frames: Mutex::new((0..PAGES_IN_MEMORY).collect()),
+            page_to_frame: RwLock::new(HashMap::new()),
+            evict_manager: EvictManager::new(PAGES_IN_MEMORY),
         }
     }
 
-    fn get_in_memory_page(&self, page_id: u64) -> &RwLock<Page> {
-        let page_idx = self.idx_from_page_id(page_id);
+    fn page(&self, page_id: PageID) -> &RwLock<Page> {
+        let page_idx = self.frame(page_id);
         self.pages.get(page_idx).unwrap()
     }
 
-    fn unpin(&self, page_id: u64) {
+    fn unpin(&self, page_id: PageID) {
         // Why not auto mut like in function signature?
-        let mut page = self.get_in_memory_page(page_id).write().unwrap();
+        let mut page = self.page(page_id).write().unwrap();
         page.pins -= 1;
         if page.pins == 0 {
-            self.evict_manager.add_to_queue(page_id)
+            self.evict_manager.add_to_queue(self.frame(page_id))
         }
     }
 
-    fn pin(&self, page_id: u64) {
-        let mut page = self.get_in_memory_page(page_id).write().unwrap();
+    fn pin(&self, page_id: PageID) {
+        let mut page = self.page(page_id).write().unwrap();
         page.pins += 1;
         if page.pins == 1 {
-            self.evict_manager.remove_from_queue(page_id);
+            self.evict_manager.remove_from_queue(self.frame(page_id));
         }
     }
 
     /// Only let people call this when managed by an Arc
-    pub fn get_page_ref(self: &Arc<Self>, page_id: u64) -> Result<PageRef, String> {
+    pub fn get_page_ref(self: &Arc<Self>, page_id: PageID) -> Result<PageRef, BufferPoolError> {
         // Can't do this in match -> need to turn &usize into usize to avoid a deadlock
-        let lookup_res = self.id_to_idx.read().unwrap().get(&page_id).copied();
+        let lookup_res = self.page_to_frame.read().unwrap().get(&page_id).copied();
 
         match lookup_res {
             Some(_) => {
@@ -174,10 +186,13 @@ impl BufferPool {
                 })
             }
             None => {
-                let (evict_idx, evict_id) = self.get_to_evict();
+                let evict_frame = self
+                    .evict_manager
+                    .victim()
+                    .ok_or(BufferPoolError::NoFreeFrames)?;
 
                 // Lock page
-                let mut page_write = self.pages.get(evict_idx).unwrap().write().unwrap();
+                let mut page_write = self.pages.get(evict_frame).unwrap().write().unwrap();
 
                 if page_write.is_dirty {
                     self.write_page(&page_write);
@@ -185,12 +200,12 @@ impl BufferPool {
 
                 // Wrap in its own scope to return the lock to not lock the DB during read
                 {
-                    let mut page_lookup_write = self.id_to_idx.write().unwrap();
-                    page_lookup_write.remove(&evict_id);
-                    page_lookup_write.insert(page_id, evict_idx);
+                    let mut page_lookup_write = self.page_to_frame.write().unwrap();
+                    page_lookup_write.remove(&page_write.page_id.unwrap());
+                    page_lookup_write.insert(page_id, evict_frame);
                 }
 
-                // Update page
+                // Update load new page into frame
                 page_write.load_new(page_id, self.read_page(page_id));
 
                 Ok(PageRef {
@@ -201,38 +216,15 @@ impl BufferPool {
         }
     }
 
-    fn read_page(&self, page_id: u64) -> [u8; PAGE_SIZE] {
+    fn read_page(&self, page_id: PageID) -> [u8; PAGE_SIZE] {
         todo!()
-    }
-
-    fn get_to_evict(&self) -> Result<usize, String> {
-        // Get either (a) an empty spot or (b) the least recently used un-pinned page
-        let lru_lock = self.lru.read().unwrap();
-        let mut cidx = 0;
-        let (page_idx, page_id) = loop {
-            match lru_lock.get(cidx).unwrap() {
-                Some(candidate_idx) => {
-                    let page_lock = self.pages.get(*candidate_idx).unwrap().read().unwrap();
-                    if page_lock.pins == Some(0) {
-                        break (*candidate_idx, page_lock.page_id);
-                    }
-                }
-                None => break (cidx, None),
-            }
-
-            cidx += 1;
-            if cidx >= PAGES_IN_MEMORY {
-                break (0, None);
-            }
-        };
-        (page_idx, page_id)
     }
 
     fn write_page(&self, guard: &RwLockWriteGuard<Page>) {
         todo!()
     }
 
-    fn idx_from_page_id(&self, page_id: u64) -> usize {
-        *self.id_to_idx.read().unwrap().get(&page_id).unwrap()
+    fn frame(&self, page_id: PageID) -> Frame {
+        *self.page_to_frame.read().unwrap().get(&page_id).unwrap()
     }
 }
