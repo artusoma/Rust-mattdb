@@ -121,7 +121,7 @@ trait DBReader {
 }
 
 #[derive(Debug)]
-struct DiskIO {
+pub struct DiskIO {
     file: PathBuf,
 }
 
@@ -153,8 +153,10 @@ impl DiskIO {
 /// Should be wrapped in an Arc
 #[derive(Debug)]
 pub struct BufferPool<R: DBReader> {
-    /// this stays fixed -- no need for a Mutex on `pages` (the Vec) itself. Could be a "boxed slice"
+    /// The vector stays fixed -- no need for a Mutex on `pages` (the Vec) itself. Could be a "boxed slice".
+    /// We need a RwLock on each Page, however -- because those threads can change.
     pages: Vec<RwLock<Page>>,
+    /// Mapping from page id to frame
     page_table: RwLock<HashMap<PageID, Frame>>,
     /// Least recently used tracker
     evict_manager: EvictManager,
@@ -182,9 +184,7 @@ impl<R: DBReader> BufferPool<R> {
     fn unpin(&self, page_id: PageID) {
         // Why not auto mut like in function signature?
         let mut page = self.page(page_id).write().unwrap();
-        println!("{}", page.pins);
         page.pins -= 1;
-        println!("{}", page.pins);
         if page.pins == 0 {
             self.evict_manager.add_to_queue(self.frame(page_id))
         }
@@ -192,9 +192,7 @@ impl<R: DBReader> BufferPool<R> {
 
     fn pin(&self, page_id: PageID) {
         let mut page = self.page(page_id).write().unwrap();
-        println!("{}", page.pins);
         page.pins += 1;
-        println!("{}", page.pins);
         if page.pins == 1 {
             self.evict_manager.remove_from_queue(self.frame(page_id));
         }
@@ -203,9 +201,9 @@ impl<R: DBReader> BufferPool<R> {
     /// Only let people call this when managed by an Arc
     pub fn get_page_ref(self: &Arc<Self>, page_id: PageID) -> Result<PageRef<R>, BufferPoolError> {
         // Can't do this in match -> need to turn &usize into usize to avoid a deadlock
-        let lookup_res = self.page_table.read().unwrap().get(&page_id).copied();
+        let cache_res = self.page_table.read().unwrap().get(&page_id).copied();
 
-        match lookup_res {
+        match cache_res {
             Some(_) => {
                 self.pin(page_id);
                 Ok(PageRef {
@@ -228,11 +226,11 @@ impl<R: DBReader> BufferPool<R> {
 
                 // Wrap in its own scope to return the lock to not lock the DB during read
                 {
-                    let mut page_lookup_write = self.page_table.write().unwrap();
+                    let mut table_write = self.page_table.write().unwrap();
                     if let Some(old_page_id) = page_write.page_id {
-                        page_lookup_write.remove(&old_page_id);
+                        table_write.remove(&old_page_id);
                     }
-                    page_lookup_write.insert(page_id, evict_frame);
+                    table_write.insert(page_id, evict_frame);
                 }
 
                 // Update load new page into frame
@@ -335,7 +333,7 @@ mod tests {
         drop(page_ref);
         assert!(thread_pool.get_page_ref(1).is_err());
 
-        // After unpinning both we are good.
+        // After unpinning both we are good to bring new page into memory
         drop(page_ref2);
         assert!(thread_pool.get_page_ref(1).is_ok());
     }
