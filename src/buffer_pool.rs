@@ -1,5 +1,12 @@
 use std::{
-    collections::{HashMap, VecDeque}, ffi::{FromBytesUntilNulError, FromVecWithNulError}, ops::{Deref, DerefMut}, path::PathBuf, sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard}, thread::LocalKey
+    collections::{HashMap, VecDeque},
+    ffi::{FromBytesUntilNulError, FromVecWithNulError},
+    hash::Hash,
+    io::Read,
+    ops::{Deref, DerefMut, RangeBounds},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard},
+    thread::LocalKey,
 };
 
 const PAGE_SIZE: usize = 8192;
@@ -33,24 +40,24 @@ impl Page {
         self.content = content;
         self.page_id = Some(page_id);
         self.is_dirty = false;
-        self.pins = 0;
+        self.pins = 1;
     }
 }
 
 /// Fat pointer to BufferPool with page id to be referenced attached
-pub struct PageRef {
-    pool: Arc<BufferPool>,
+pub struct PageRef<R: DBReader> {
+    pool: Arc<BufferPool<R>>,
     page_id: PageID,
 }
 
 /// When PageRef is dropped, decrement the page's pin count
-impl Drop for PageRef {
+impl<R: DBReader> Drop for PageRef<R> {
     fn drop(&mut self) {
         self.pool.unpin(self.page_id);
     }
 }
 
-impl Deref for PageRef {
+impl<R: DBReader> Deref for PageRef<R> {
     type Target = RwLock<Page>;
 
     fn deref(&self) -> &Self::Target {
@@ -75,13 +82,13 @@ impl EvictManager {
         }
     }
 
-    fn queue(&self) -> MutexGuard<VecDeque<Frame>> {
+    fn queue(&self) -> MutexGuard<'_, VecDeque<Frame>> {
         self.evict_queue.lock().unwrap()
     }
 
     fn add_to_queue(&self, frame: Frame) {
         let mut queue = self.queue();
-        if queue.contains(&frame) {
+        if !queue.contains(&frame) {
             queue.push_back(frame)
         }
     }
@@ -102,27 +109,41 @@ impl EvictManager {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 pub enum BufferPoolError {
-    #[error("No frames available to evict in buffer.")]
+    #[error("No frames available in buffer.")]
     NoFreeFrames,
 }
 
-struct DiskIO {
-    file: PathBuf
+trait DBReader {
+    fn write_page(&self, page_id: PageID, content: &[u8; PAGE_SIZE]);
+    fn read_page(&self, page_id: PageID) -> [u8; PAGE_SIZE];
 }
 
-impl DiskIO {
-    fn write_page(&self, page_id: PageID, content: [u8; PAGE_SIZE]) {
+#[derive(Debug)]
+struct DiskIO {
+    file: PathBuf,
+}
 
-    }
-
+impl DBReader for DiskIO {
     fn read_page(&self, page_id: PageID) -> [u8; PAGE_SIZE] {
         todo!()
     }
 
-    fn page_offset(&self, page_id: PageID) -> u8 {
+    fn write_page(&self, page_id: PageID, content: &[u8; PAGE_SIZE]) {
         todo!()
+    }
+}
+
+impl DiskIO {
+    fn new() -> Self {
+        DiskIO {
+            file: PathBuf::new(),
+        }
+    }
+
+    fn offset(&self, page_id: PageID) -> u64 {
+        page_id * PAGE_SIZE as u64
     }
 }
 
@@ -131,22 +152,25 @@ impl DiskIO {
 ///
 /// Should be wrapped in an Arc
 #[derive(Debug)]
-pub struct BufferPool {
+pub struct BufferPool<R: DBReader> {
     /// this stays fixed -- no need for a Mutex on `pages` (the Vec) itself. Could be a "boxed slice"
     pages: Vec<RwLock<Page>>,
-    page_to_frame: RwLock<HashMap<PageID, Frame>>,
+    page_table: RwLock<HashMap<PageID, Frame>>,
     /// Least recently used tracker
     evict_manager: EvictManager,
+    /// Helper to read and write
+    disk_io: R,
 }
 
-impl BufferPool {
-    fn new() -> Self {
+impl<R: DBReader> BufferPool<R> {
+    fn new(disk: R, size: usize) -> Self {
         Self {
             pages: std::iter::repeat_with(|| RwLock::new(Page::default()))
-                .take(PAGES_IN_MEMORY)
+                .take(size)
                 .collect(),
-            page_to_frame: RwLock::new(HashMap::new()),
-            evict_manager: EvictManager::new(PAGES_IN_MEMORY),
+            page_table: RwLock::new(HashMap::new()),
+            evict_manager: EvictManager::new(size),
+            disk_io: disk,
         }
     }
 
@@ -158,7 +182,9 @@ impl BufferPool {
     fn unpin(&self, page_id: PageID) {
         // Why not auto mut like in function signature?
         let mut page = self.page(page_id).write().unwrap();
+        println!("{}", page.pins);
         page.pins -= 1;
+        println!("{}", page.pins);
         if page.pins == 0 {
             self.evict_manager.add_to_queue(self.frame(page_id))
         }
@@ -166,16 +192,18 @@ impl BufferPool {
 
     fn pin(&self, page_id: PageID) {
         let mut page = self.page(page_id).write().unwrap();
+        println!("{}", page.pins);
         page.pins += 1;
+        println!("{}", page.pins);
         if page.pins == 1 {
             self.evict_manager.remove_from_queue(self.frame(page_id));
         }
     }
 
     /// Only let people call this when managed by an Arc
-    pub fn get_page_ref(self: &Arc<Self>, page_id: PageID) -> Result<PageRef, BufferPoolError> {
+    pub fn get_page_ref(self: &Arc<Self>, page_id: PageID) -> Result<PageRef<R>, BufferPoolError> {
         // Can't do this in match -> need to turn &usize into usize to avoid a deadlock
-        let lookup_res = self.page_to_frame.read().unwrap().get(&page_id).copied();
+        let lookup_res = self.page_table.read().unwrap().get(&page_id).copied();
 
         match lookup_res {
             Some(_) => {
@@ -200,8 +228,10 @@ impl BufferPool {
 
                 // Wrap in its own scope to return the lock to not lock the DB during read
                 {
-                    let mut page_lookup_write = self.page_to_frame.write().unwrap();
-                    page_lookup_write.remove(&page_write.page_id.unwrap());
+                    let mut page_lookup_write = self.page_table.write().unwrap();
+                    if let Some(old_page_id) = page_write.page_id {
+                        page_lookup_write.remove(&old_page_id);
+                    }
                     page_lookup_write.insert(page_id, evict_frame);
                 }
 
@@ -217,14 +247,96 @@ impl BufferPool {
     }
 
     fn read_page(&self, page_id: PageID) -> [u8; PAGE_SIZE] {
-        todo!()
+        self.disk_io.read_page(page_id)
     }
 
     fn write_page(&self, guard: &RwLockWriteGuard<Page>) {
-        todo!()
+        self.disk_io
+            .write_page(guard.page_id.unwrap(), &guard.content)
     }
 
     fn frame(&self, page_id: PageID) -> Frame {
-        *self.page_to_frame.read().unwrap().get(&page_id).unwrap()
+        *self.page_table.read().unwrap().get(&page_id).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    struct MockReader;
+
+    impl MockReader {
+        fn new() -> Self {
+            Self {}
+        }
+    }
+
+    impl DBReader for MockReader {
+        fn write_page(&self, page_id: PageID, content: &[u8; PAGE_SIZE]) {
+            // Definitely wrote a page here
+        }
+
+        fn read_page(&self, page_id: PageID) -> [u8; PAGE_SIZE] {
+            // Definitely read a real page here, really
+            [0u8; PAGE_SIZE]
+        }
+    }
+
+    #[test]
+    fn test_evict_manager() {
+        let evict = EvictManager::new(0);
+
+        // Test add and pop
+        evict.add_to_queue(1);
+        assert_eq!(evict.victim(), Some(1));
+
+        // Test now free frames are empty => None
+        assert_eq!(evict.victim(), None);
+
+        // Test add, add, pop
+        evict.add_to_queue(0);
+        evict.add_to_queue(5);
+        assert_eq!(evict.victim(), Some(0));
+
+        // Add 7, remove 5
+        evict.add_to_queue(7);
+        evict.remove_from_queue(5);
+        assert_eq!(evict.victim(), Some(7));
+
+        // Test popping off of queue again
+        let evict = EvictManager::new(2);
+        assert_eq!(evict.victim(), Some(1));
+        assert_eq!(evict.victim(), Some(0));
+        assert_eq!(evict.victim(), None);
+    }
+
+    #[test]
+    fn test_buffer_pool() {
+        // Create ARC of new pool
+        let pool = Arc::new(BufferPool::new(MockReader::new(), 1));
+
+        // Create copy (as a new thread would)
+        let thread_pool = Arc::clone(&pool);
+
+        // Create new ref
+        let page_ref = thread_pool.get_page_ref(0).unwrap();
+        assert_eq!(page_ref.read().unwrap().page_id, Some(0));
+        
+        // Use created frame
+        let page_ref2 = thread_pool.get_page_ref(0).unwrap();
+        assert_eq!(page_ref2.read().unwrap().page_id, Some(0));
+        
+        // Try to pull new pool in -> error! No frames left
+        assert!(thread_pool.get_page_ref(1).is_err());
+
+        // Even if we try to drop one ref, the other still is pinned:
+        drop(page_ref);
+        assert!(thread_pool.get_page_ref(1).is_err());
+
+        // After unpinning both we are good.
+        drop(page_ref2);
+        assert!(thread_pool.get_page_ref(1).is_ok());
     }
 }
