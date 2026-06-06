@@ -2,6 +2,20 @@
 
 use std::fmt::Write;
 
+#[macro_export]
+macro_rules! to_rust_type {
+    ($stream:ident, $data_type:expr, $data_value:pat) => {
+        let res = Deserializer::deserialize_next(&mut $stream, $data_type);
+        let $data_value = (match res {
+            Ok(x) => x,
+            Err(_) => panic!(),
+        }) else {
+            panic!()
+        };
+    };
+}
+pub use to_rust_type as to_rust_type;
+
 /// Errors while performing data deserialization
 #[derive(thiserror::Error, Debug, PartialEq, PartialOrd)]
 enum DeserializationError {
@@ -68,7 +82,7 @@ impl WriteByteStream {
 
 /// Stream of bytes to be used in Deserializer
 #[derive(Debug)]
-struct ReadByteStream<'a> {
+pub struct ReadByteStream<'a> {
     bytes: &'a [u8],
     position: usize,
     length: usize,
@@ -77,7 +91,7 @@ struct ReadByteStream<'a> {
 impl<'a> ReadByteStream<'a> {
     /// Get next `len` bytes from data and advance the position, checking
     /// if we are out of bounds to prevent a panic!
-    fn read(&mut self, len: usize) -> Result<&[u8], DeserializationError> {
+    pub fn read(&mut self, len: usize) -> Result<&[u8], DeserializationError> {
         let start = self.position;
         let end = start + len;
         self.position += len;
@@ -89,7 +103,7 @@ impl<'a> ReadByteStream<'a> {
         }
     }
 
-    fn new(bytes: &'a [u8]) -> Self {
+    pub fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
             position: 0,
@@ -102,7 +116,7 @@ impl<'a> ReadByteStream<'a> {
 #[derive(Debug, PartialEq, Clone)]
 pub enum DataValue {
     Char(String),
-    Int(u64),
+    Int(i64),
 }
 
 impl std::fmt::Display for DataValue {
@@ -125,7 +139,10 @@ pub enum DataType {
 
 impl DataType {
     /// Deserialize a byte stream to a DataValue
-    fn deserialize(&self, stream: &mut ReadByteStream) -> Result<DataValue, DeserializationError> {
+    pub fn deserialize(
+        &self,
+        stream: &mut ReadByteStream,
+    ) -> Result<DataValue, DeserializationError> {
         use DeserializationError::*;
         let bytes = stream.read(self.size())?;
         match self {
@@ -135,7 +152,7 @@ impl DataType {
                     .trim_end_matches('\0')
                     .to_owned(),
             )),
-            Self::Int => Ok(DataValue::Int(u64::from_be_bytes(
+            Self::Int => Ok(DataValue::Int(i64::from_be_bytes(
                 bytes
                     .try_into()
                     .map_err(|e: std::array::TryFromSliceError| {
@@ -146,7 +163,7 @@ impl DataType {
     }
 
     /// Serializes a value to the stream from this type
-    fn serialize(
+    pub fn serialize(
         &self,
         stream: &mut WriteByteStream,
         data_value: &DataValue,
@@ -173,7 +190,7 @@ impl DataType {
     }
 
     /// Retreives the size of an element in bytes
-    fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         match self {
             Self::Char(n) => *n,
             Self::Int => 8,
@@ -195,8 +212,11 @@ impl std::fmt::Display for DataType {
 pub struct Serializer {}
 
 impl Serializer {
-    fn serialize(
-        &self,
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn serialize(
         dtypes: &Vec<DataType>,
         values: &Vec<DataValue>,
     ) -> Result<Vec<u8>, SerializationError> {
@@ -220,12 +240,18 @@ impl Default for Serializer {
 pub struct Deserializer {}
 
 impl Deserializer {
-    fn deserialize(
-        &self,
+    pub fn deserialize(
         stream: &mut ReadByteStream,
         dtypes: Vec<DataType>,
     ) -> Result<Vec<DataValue>, DeserializationError> {
         dtypes.into_iter().map(|d| d.deserialize(stream)).collect()
+    }
+
+    pub fn deserialize_next(
+        stream: &mut ReadByteStream,
+        dtype: DataType,
+    ) -> Result<DataValue, DeserializationError> {
+        dtype.deserialize(stream)
     }
 }
 
@@ -247,10 +273,10 @@ mod tests {
             {
                 let values = vec![$($val),+];
                 let types = vec![$($type),+];
-                let serialized = Serializer::default().serialize(&types, &values).unwrap();
+                let serialized = Serializer::serialize(&types, &values).unwrap();
 
                 let mut stream = ReadByteStream::new(&serialized);
-                let deserialized = Deserializer::default().deserialize(&mut stream, types).unwrap();
+                let deserialized = Deserializer::deserialize(&mut stream, types).unwrap();
                 println!("{:?}", deserialized);
                 assert_eq!(values, deserialized)
             }
@@ -289,10 +315,21 @@ mod tests {
     #[test]
     fn raises_string_overflow() {
         let mut stream = Vec::<u8>::new();
-        let res = Serializer::default().serialize(
+        let res = Serializer::serialize(
             &vec![DataType::Char(3)],
             &vec![DataValue::Char("overflow".to_string())],
         );
         assert_eq!(res, Err(SerializationError::StringOverflow(3, 8)))
+    }
+
+    #[test]
+    fn to_rust_type() {
+        let values = vec![DataValue::Int(5)];
+        let types = vec![DataType::Int];
+        let serialized = Serializer::serialize(&types, &values).unwrap();
+
+        let mut stream = ReadByteStream::new(&serialized);
+        to_rust_type!(stream, DataType::Int, DataValue::Int(x));
+        assert_eq!(x, 5)
     }
 }

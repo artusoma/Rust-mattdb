@@ -24,6 +24,23 @@ pub struct Page {
     is_dirty: bool,
 }
 
+impl Deref for Page {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.content
+    }
+}
+
+/// DerefMut is going to set the page dirty when something asks for it.
+/// Make sures any mutable call is picked up as dirty.
+impl DerefMut for Page {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.is_dirty = true;
+        &mut self.content
+    }
+}
+
 impl Default for Page {
     fn default() -> Self {
         Page {
@@ -115,14 +132,17 @@ pub enum BufferPoolError {
     NoFreeFrames,
 }
 
-trait DBReader {
+pub trait DBReader {
     fn write_page(&self, page_id: PageID, content: &[u8; PAGE_SIZE]);
     fn read_page(&self, page_id: PageID) -> [u8; PAGE_SIZE];
+    fn new_page(&self) -> PageID;
 }
 
+/// Handles reading and writing from disk
 #[derive(Debug)]
 pub struct DiskIO {
     file: PathBuf,
+    pages: usize,
 }
 
 impl DBReader for DiskIO {
@@ -133,12 +153,17 @@ impl DBReader for DiskIO {
     fn write_page(&self, page_id: PageID, content: &[u8; PAGE_SIZE]) {
         todo!()
     }
+
+    fn new_page(&self) -> PageID {
+        todo!()
+    }
 }
 
 impl DiskIO {
     fn new() -> Self {
         DiskIO {
             file: PathBuf::new(),
+            pages: 0,
         }
     }
 
@@ -256,6 +281,11 @@ impl<R: DBReader> BufferPool<R> {
     fn frame(&self, page_id: PageID) -> Frame {
         *self.page_table.read().unwrap().get(&page_id).unwrap()
     }
+
+    fn new_page(self: &Arc<Self>) -> Result<PageRef<R>, BufferPoolError> {
+        let new_id = self.disk_io.new_page();
+        self.get_page_ref(new_id)
+    }
 }
 
 #[cfg(test)]
@@ -272,13 +302,17 @@ mod tests {
     }
 
     impl DBReader for MockReader {
-        fn write_page(&self, page_id: PageID, content: &[u8; PAGE_SIZE]) {
+        fn write_page(&self, _page_id: PageID, _content: &[u8; PAGE_SIZE]) {
             // Definitely wrote a page here
         }
 
-        fn read_page(&self, page_id: PageID) -> [u8; PAGE_SIZE] {
+        fn read_page(&self, _page_id: PageID) -> [u8; PAGE_SIZE] {
             // Definitely read a real page here, really
             [0u8; PAGE_SIZE]
+        }
+
+        fn new_page(&self) -> PageID {
+            todo!()
         }
     }
 
@@ -321,11 +355,11 @@ mod tests {
         // Create new ref
         let page_ref = thread_pool.get_page_ref(0).unwrap();
         assert_eq!(page_ref.read().unwrap().page_id, Some(0));
-        
+
         // Use created frame
         let page_ref2 = thread_pool.get_page_ref(0).unwrap();
         assert_eq!(page_ref2.read().unwrap().page_id, Some(0));
-        
+
         // Try to pull new pool in -> error! No frames left
         assert!(thread_pool.get_page_ref(1).is_err());
 
