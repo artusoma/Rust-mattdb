@@ -13,8 +13,8 @@ const PAGE_SIZE: usize = 8192;
 const PAGES_IN_MEMORY: usize = 1000;
 
 // Types because I keep getting confused
-type PageID = u64;
-type Frame = usize;
+pub type PageID = u64;
+pub type Frame = usize;
 
 #[derive(Debug, Clone)]
 pub struct Page {

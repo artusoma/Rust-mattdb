@@ -18,7 +18,7 @@ pub use to_rust_type as to_rust_type;
 
 /// Errors while performing data deserialization
 #[derive(thiserror::Error, Debug, PartialEq, PartialOrd)]
-enum DeserializationError {
+pub enum DeserializationError {
     #[error("Error deserializing string: {0}")]
     StringDeserializeError(String),
     #[error("Error deserializing int: {0}")]
@@ -29,7 +29,7 @@ enum DeserializationError {
 
 /// Errors while performing data serialization
 #[derive(thiserror::Error, Debug, PartialEq)]
-enum SerializationError {
+pub enum SerializationError {
     #[error("Error serializing: {0}")]
     SerializtionError(String),
     #[error("String overflow: expected max length {0}, got {1}")]
