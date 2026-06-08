@@ -314,7 +314,6 @@ mod tests {
 
     #[test]
     fn raises_string_overflow() {
-        let mut stream = Vec::<u8>::new();
         let res = Serializer::serialize(
             &vec![DataType::Char(3)],
             &vec![DataValue::Char("overflow".to_string())],

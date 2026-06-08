@@ -30,7 +30,6 @@
 //!         /// pageRw next() -> enum::{Data, Done, NeedNextSibling}
 
 use crate::buffer_pool::Page;
-use crate::pages::PageType::IndexLeaf;
 
 use super::buffer_pool::{BufferPool, BufferPoolError, DBReader, PageID, PageRef};
 use super::serialization::{
@@ -56,28 +55,34 @@ enum InsertResult {
 
 #[derive(Debug)]
 enum LeafReadResult {
-    Tuple(Vec<DataValue>),
+    Tuple(Values),
     PageNeeded(PageID),
 }
 
 #[derive(Debug, PartialEq)]
-enum PageType {
-    Node,
+struct Node;
+
+impl Node {
+    fn get_child<R: DBReader>(&self, page: &PageRef<R>, key: &Values, key_type: &Types) -> PageID {
+        todo!()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Leaf {
     IndexLeaf,
     DataLeaf,
 }
 
-struct ScanParam<'a> {
-    keyt: &'a Types,
-    valt: &'a Types,
-    start_key: &'a Values,
-    end_key: &'a Values,
-}
-
-impl PageType {
-    fn next<R: DBReader>(&self, page: &PageRef<R>, params: &ScanParam) -> LeafReadResult {
+impl Leaf {
+    fn next<R: DBReader>(
+        &self,
+        page: &PageRef<R>,
+        key: &Values,
+        key_type: &Types,
+        value_types: &Types,
+    ) -> LeafReadResult {
         match self {
-            Self::Node => LeafReadResult::PageNeeded(0),
             Self::DataLeaf => {
                 todo!()
             }
@@ -86,10 +91,38 @@ impl PageType {
             }
         }
     }
+
+    fn insert<R: DBReader>(
+        &self,
+        page: &PageRef<R>,
+        key: &Values,
+        key_type: &Types,
+        value_types: &Types,
+        values: &Values,
+    ) -> InsertResult {
+        todo!()
+    }
+
+    fn delete<R: DBReader>(
+        &self,
+        page: &PageRef<R>,
+        key: &Values,
+        key_type: &Types,
+    ) -> InsertResult {
+        todo!()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PageType {
+    Node(Node),
+    Leaf(Leaf),
 }
 
 struct BTree<R: DBReader> {
     pool: Arc<BufferPool<R>>,
+    key_type: Types,
+    value_type: Types,
 }
 
 fn get_page_type<R: DBReader>(page_ref: &PageRef<R>) -> PageType {
@@ -101,30 +134,54 @@ fn get_next_sibling<R: DBReader>(page_ref: &PageRef<R>) -> PageID {
 }
 
 impl<R: DBReader> BTree<R> {
-    fn scan<'a>(&self, page_id: PageID, params: &'a &ScanParam) -> ScanIterator<'a, R> {
+    fn scan<'a>(
+        &self,
+        page_id: PageID,
+        start_key: &'a Values,
+        end_key: &'a Values,
+    ) -> ScanIterator<'a, R> {
         // Find leaf node
-        let page = page_id;
-        let mut page_ref = self.pool.get_page_ref(page).unwrap();
-        let mut page_type = get_page_type(&page_ref);
-        while page_type == PageType::Node {
-            let LeafReadResult::PageNeeded(page) = page_type.next(&page_ref, params) else {
-                panic!()
-            };
-            page_ref = self.pool.get_page_ref(page).unwrap();
-            page_type = get_page_type(&page_ref);
-        }
-
+        let leaf_id = self.get_leaf(page_id, start_key);
+        let page_ref = self.pool.get_page_ref(leaf_id).unwrap();
+        let page_type = get_page_type(&page_ref);
         // Return an iterator to get rows in scan
         ScanIterator::new(
-            self.pool.get_page_ref(page).unwrap(),
+            page_ref,
             page_type,
-            params,
+            &start_key,
+            &end_key,
             Arc::clone(&self.pool),
         )
     }
 
-    fn insert(&self, key: Vec<DataValue>, value: Vec<DataValue>) -> InsertResult {
-        todo!()
+    fn get_leaf(&self, page_id: PageID, key: &Values) -> PageID {
+        let mut page = page_id;
+        let mut page_ref = self.pool.get_page_ref(page).unwrap();
+        let mut page_type = get_page_type(&page_ref);
+        loop {
+            if let PageType::Node(node) = page_type {
+                page = node.get_child(&page_ref, key, &self.key_type);
+                page_ref = self.pool.get_page_ref(page).unwrap();
+                page_type = get_page_type(&page_ref);
+            } else {
+                break page;
+            }
+        }
+    }
+
+    fn insert(&self, page_id: PageID, key: &Vec<DataValue>, value: &Vec<DataValue>) {
+        let leaf_id = self.get_leaf(page_id, key);
+        let page_ref = self.pool.get_page_ref(leaf_id).unwrap();
+        let page_type = get_page_type(&page_ref);
+        match page_type {
+            PageType::Leaf(leaf) => match leaf.insert(&page_ref, key, &self.key_type, &self.value_type, value) {
+                InsertResult::Ok => return,
+                InsertResult::OutOfSpace => {
+                    todo!()
+                }
+            },
+            _ => panic!(),
+        }
     }
 
     fn delete(&self, key: Vec<DataValue>) -> Result<(), BTreeError> {
@@ -134,22 +191,25 @@ impl<R: DBReader> BTree<R> {
 
 struct ScanIterator<'a, R: DBReader> {
     leaf: PageRef<R>,
-    page_type: PageType,
-    param: &'a ScanParam<'a>,
+    page_type: Leaf,
+    start_key: &'a Values,
+    end_key: &'a Values,
     pool: Arc<BufferPool<R>>,
 }
 
 impl<'a, R: DBReader> ScanIterator<'a, R> {
     fn new(
         leaf: PageRef<R>,
-        page_type: PageType,
-        param: &'a ScanParam,
+        page_type: Leaf,
+        start_key: &'a Values,
+        end_key: &'a Values,
         pool: Arc<BufferPool<R>>,
     ) -> Self {
         Self {
             leaf,
             page_type,
-            param,
+            start_key,
+            end_key,
             pool,
         }
     }

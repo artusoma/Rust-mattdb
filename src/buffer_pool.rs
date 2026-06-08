@@ -78,7 +78,7 @@ impl<R: DBReader> Deref for PageRef<R> {
     type Target = RwLock<Page>;
 
     fn deref(&self) -> &Self::Target {
-        self.pool.pages.get(self.pool.frame(self.page_id)).unwrap()
+        self.pool.page(self.page_id)
     }
 }
 
