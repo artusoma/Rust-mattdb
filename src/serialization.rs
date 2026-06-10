@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 #[macro_export]
 macro_rules! to_rust_type {
-    ($stream:ident, $data_type:expr, $data_value:pat) => {
+    ($stream:ident, $data_type:expr, $data_value:pat $(, $cast:expr)?) => {
         let res = Deserializer::deserialize_next(&mut $stream, $data_type);
         let $data_value = (match res {
             Ok(x) => x,
@@ -14,7 +14,7 @@ macro_rules! to_rust_type {
         };
     };
 }
-pub use to_rust_type as to_rust_type;
+pub use to_rust_type;
 
 /// Errors while performing data deserialization
 #[derive(thiserror::Error, Debug, PartialEq, PartialOrd)]
@@ -110,20 +110,39 @@ impl<'a> ReadByteStream<'a> {
             length: bytes.len(),
         }
     }
+
+    pub fn next(&mut self, dtypes: &[DataType]) -> Result<Vec<DataValue>, DeserializationError> {
+        Deserializer::deserialize(self, &dtypes)
+    }
 }
 
 /// Enum to represent Rust values from table dtypes
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, PartialOrd)]
 pub enum DataValue {
     Char(String),
-    Int(i64),
+    BigInt(i64),
+    Int(i32),
+    SmallInt(i16),
+}
+
+impl DataValue {
+    pub fn size(&self) -> usize {
+        match self {
+            Self::Char(s) => s.len(),
+            Self::BigInt(_) => 8,
+            Self::Int(_) => 4,
+            Self::SmallInt(_) => 2,
+        }
+    }
 }
 
 impl std::fmt::Display for DataValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Char(s) => write!(f, "{}", s),
+            Self::Char(x) => write!(f, "{}", x),
+            Self::BigInt(x) => write!(f, "{}", x),
             Self::Int(x) => write!(f, "{}", x),
+            Self::SmallInt(x) => write!(f, "{}", x),
         }
     }
 }
@@ -134,7 +153,9 @@ impl std::fmt::Display for DataValue {
 #[derive(Debug, PartialEq, Clone)]
 pub enum DataType {
     Char(usize),
+    BigInt,
     Int,
+    SmallInt,
 }
 
 impl DataType {
@@ -146,13 +167,27 @@ impl DataType {
         use DeserializationError::*;
         let bytes = stream.read(self.size())?;
         match self {
-            Self::Char(x) => Ok(DataValue::Char(
+            Self::Char(_) => Ok(DataValue::Char(
                 str::from_utf8(bytes)
                     .map_err(|e| StringDeserializeError(e.to_string()))?
                     .trim_end_matches('\0')
                     .to_owned(),
             )),
-            Self::Int => Ok(DataValue::Int(i64::from_be_bytes(
+            Self::BigInt => Ok(DataValue::BigInt(i64::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|e: std::array::TryFromSliceError| {
+                        IntDeserializeError(e.to_string())
+                    })?,
+            ))),
+            Self::Int => Ok(DataValue::Int(i32::from_be_bytes(
+                bytes
+                    .try_into()
+                    .map_err(|e: std::array::TryFromSliceError| {
+                        IntDeserializeError(e.to_string())
+                    })?,
+            ))),
+            Self::SmallInt => Ok(DataValue::SmallInt(i16::from_be_bytes(
                 bytes
                     .try_into()
                     .map_err(|e: std::array::TryFromSliceError| {
@@ -170,8 +205,20 @@ impl DataType {
     ) -> Result<(), SerializationError> {
         use SerializationError::*;
         match (self, data_value) {
-            (DataType::Int, DataValue::Int(x)) => {
+            (DataType::BigInt, DataValue::BigInt(x)) => {
                 let bytes: [u8; 8] = x.to_be_bytes();
+                let slice: &[u8] = &bytes;
+                stream.write(slice)?;
+                Ok(())
+            }
+            (DataType::Int, DataValue::Int(x)) => {
+                let bytes: [u8; 4] = x.to_be_bytes();
+                let slice: &[u8] = &bytes;
+                stream.write(slice)?;
+                Ok(())
+            }
+            (DataType::SmallInt, DataValue::SmallInt(x)) => {
+                let bytes: [u8; 2] = x.to_be_bytes();
                 let slice: &[u8] = &bytes;
                 stream.write(slice)?;
                 Ok(())
@@ -193,7 +240,9 @@ impl DataType {
     pub fn size(&self) -> usize {
         match self {
             Self::Char(n) => *n,
-            Self::Int => 8,
+            Self::BigInt => 8,
+            Self::Int => 4,
+            Self::SmallInt => 2,
         }
     }
 }
@@ -202,7 +251,9 @@ impl std::fmt::Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Char(len) => write!(f, "Char({})", len),
+            Self::BigInt => write!(f, "BigInt"),
             Self::Int => write!(f, "Int"),
+            Self::SmallInt => write!(f, "SmallIntInt"),
         }
     }
 }
@@ -216,9 +267,18 @@ impl Serializer {
         Self {}
     }
 
+    pub fn serialize_single(
+        dtype: &DataType,
+        value: &DataValue,
+    ) -> Result<Vec<u8>, SerializationError> {
+        let mut write_stream = WriteByteStream::new(dtype.size());
+        dtype.serialize(&mut write_stream, value)?;
+        Ok(write_stream.buffer)
+    }
+
     pub fn serialize(
-        dtypes: &Vec<DataType>,
-        values: &Vec<DataValue>,
+        dtypes: &[DataType],
+        values: &[DataValue],
     ) -> Result<Vec<u8>, SerializationError> {
         let capacity: usize = dtypes.iter().map(|d| d.size()).sum();
         let mut write_stream = WriteByteStream::new(capacity);
@@ -240,11 +300,29 @@ impl Default for Serializer {
 pub struct Deserializer {}
 
 impl Deserializer {
+    pub fn deserialize_from_bytes(
+        bytes: &[u8],
+        dtypes: &[DataType],
+    ) -> Result<Vec<DataValue>, DeserializationError> {
+        let mut stream = ReadByteStream::new(bytes);
+        dtypes.iter().map(|d| d.deserialize(&mut stream)).collect()
+    }
+
+    pub fn deserialize_from_start(
+        bytes: &[u8],
+        start: usize,
+        dtypes: &[DataType],
+    ) -> Result<Vec<DataValue>, DeserializationError> {
+        let size: usize = dtypes.iter().map(|t| t.size()).sum();
+        let mut stream = ReadByteStream::new(&bytes[start..start + size]);
+        dtypes.iter().map(|d| d.deserialize(&mut stream)).collect()
+    }
+
     pub fn deserialize(
         stream: &mut ReadByteStream,
-        dtypes: Vec<DataType>,
+        dtypes: &[DataType],
     ) -> Result<Vec<DataValue>, DeserializationError> {
-        dtypes.into_iter().map(|d| d.deserialize(stream)).collect()
+        dtypes.iter().map(|d| d.deserialize(stream)).collect()
     }
 
     pub fn deserialize_next(
@@ -276,7 +354,7 @@ mod tests {
                 let serialized = Serializer::serialize(&types, &values).unwrap();
 
                 let mut stream = ReadByteStream::new(&serialized);
-                let deserialized = Deserializer::deserialize(&mut stream, types).unwrap();
+                let deserialized = Deserializer::deserialize(&mut stream, &types).unwrap();
                 println!("{:?}", deserialized);
                 assert_eq!(values, deserialized)
             }

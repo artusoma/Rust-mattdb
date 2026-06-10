@@ -9,7 +9,7 @@ use std::{
     thread::LocalKey,
 };
 
-const PAGE_SIZE: usize = 8192;
+pub const PAGE_SIZE: usize = 8192;
 const PAGES_IN_MEMORY: usize = 1000;
 
 // Types because I keep getting confused
