@@ -282,9 +282,8 @@ impl<R: DBReader> BufferPool<R> {
         *self.page_table.read().unwrap().get(&page_id).unwrap()
     }
 
-    fn new_page(self: &Arc<Self>) -> Result<PageRef<R>, BufferPoolError> {
-        let new_id = self.disk_io.new_page();
-        self.get_page_ref(new_id)
+    pub fn new_page(self: &Arc<Self>) -> PageID {
+        self.disk_io.new_page()
     }
 }
 

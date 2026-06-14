@@ -5,7 +5,7 @@ use std::fmt::Write;
 #[macro_export]
 macro_rules! to_rust_type {
     ($stream:ident, $data_type:expr, $data_value:pat $(, $cast:expr)?) => {
-        let res = Deserializer::deserialize_next(&mut $stream, $data_type);
+        let res = $crate::serialization::Deserializer::deserialize_next(&mut $stream, $data_type);
         let $data_value = (match res {
             Ok(x) => x,
             Err(_) => panic!(),

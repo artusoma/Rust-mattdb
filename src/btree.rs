@@ -5,172 +5,15 @@
 //! next
 //!
 
-use crate::buffer_pool::{BufferPool, DBReader, Page};
-use crate::serialization::{Deserializer, ReadByteStream};
+use crate::buffer_pool::{BufferPool, DBReader, Page, PageRef};
+use crate::serialization::ReadByteStream;
 use crate::to_rust_type;
 
-use super::buffer_pool::{PAGE_SIZE, PageID};
+use super::buffer_pool::PageID;
 use super::serialization::{DataType, DataValue, Serializer};
-use std::iter::Scan;
-use std::net::Shutdown::Read;
-use std::sync::Arc;
+use std::sync::{Arc, RwLockReadGuard};
 
-/// Page type in the BTree. Node pages map keys to page ids, leaf pages map keys to tuples
-#[derive(Debug, PartialEq)]
-enum PageType {
-    /// Nodes always map to Key => PageID
-    Node,
-    /// Leaf always maps Key => Tuple
-    Leaf,
-}
-
-impl PageType {
-    fn id(&self) -> u64 {
-        match self {
-            Self::Node => 0,
-            Self::Leaf => 1,
-        }
-    }
-
-    fn new(type_id: u64) -> Self {
-        match type_id {
-            0 => Self::Node,
-            1 => Self::Leaf,
-            _ => panic!(),
-        }
-    }
-}
-
-enum HeaderElem {
-    PageID,
-    PageType,
-    FreeSpace,
-    LastCommit,
-    ItemCount,
-    HeaderSize,
-    LeftPtr,
-    RightPtr,
-    FreeSpacePtr,
-}
-
-impl HeaderElem {
-    fn offset(&self) -> usize {
-        match self {
-            Self::PageID => 0,
-            Self::PageType => 4,
-            Self::FreeSpace => 8,
-            Self::LastCommit => 12,
-            Self::ItemCount => 16,
-            Self::HeaderSize => 20,
-            Self::LeftPtr => 24,
-            Self::RightPtr => 28,
-            Self::FreeSpacePtr => 32,
-        }
-    }
-}
-
-const HEADER_SIZE: usize = 4 * 9;
-
-struct PageContent<'a> {
-    header: Vec<u8>,
-    body: Vec<u8>,
-    key_type: &'a [DataType],
-    value_type: &'a [DataType],
-}
-
-impl<'a> PageContent<'a> {
-    fn new(mut bytes: Vec<u8>, key_type: &'a [DataType], value_type: &'a [DataType]) -> Self {
-        let body = bytes.split_off(HEADER_SIZE);
-        Self {
-            header: bytes,
-            body,
-            key_type,
-            value_type,
-        }
-    }
-
-    /// Inserts a new slot, returning a pointer to the open space
-    fn insert_slot(&self, data_size: usize) -> usize {
-        todo!()
-    }
-
-    /// Inserts tuple
-    fn insert_data(&self, bytes: &[u8]) -> usize {
-        todo!()
-    }
-
-    fn get(&self, element: HeaderElem) -> u64 {
-        let offset = element.offset();
-        let mut stream = ReadByteStream::new(&self.header[offset..offset + 4]);
-        to_rust_type!(stream, DataType::Int, DataValue::Int(value));
-        value as u64
-    }
-
-    fn set(&mut self, element: HeaderElem, value: u64) {
-        let offset = element.offset();
-        self.header[offset..offset + 4].copy_from_slice(
-            Serializer::serialize_single(&DataType::Int, &DataValue::Int(value as i32))
-                .unwrap()
-                .as_slice(),
-        );
-    }
-
-    /// Looks in slot array using header size and number of items as bounds
-    fn find_key_idx(&self, target_key: &[DataValue], low: usize, high: usize) -> Option<usize> {
-        // Initize index to middle of slot array
-        let idx = (high - low) / 2 + low;
-        let key = self.element(idx).0;
-
-        if key == *target_key {
-            return Some(idx);
-        }
-
-        if low == high {
-            return None;
-        }
-
-        if key.as_slice() < target_key {
-            self.find_key_idx(target_key, idx + 1, high)
-        } else {
-            if idx == 0 {
-                return None;
-            } else {
-                self.find_key_idx(target_key, low, idx - 1)
-            }
-        }
-    }
-
-    /// Find child
-    fn find_child(&self, target_key: &[DataValue], low: usize, high: usize) -> Option<usize> {
-        todo!()
-    }
-
-    /// Returns a Tuple from a given slot
-    fn element(&self, idx: usize) -> (Vec<DataValue>, Vec<DataValue>) {
-        let mut stream = ReadByteStream::new(&self.body[self.get_tuple_ptr(idx)..self.body.len()]);
-        (
-            stream.next(self.key_type).unwrap(),
-            stream.next(self.value_type).unwrap(),
-        )
-    }
-
-    /// Returns the tuple offset of the slot at idx
-    ///
-    /// Slots are 16 bytes in size (i16; small int)
-    fn get_tuple_ptr(&self, idx: usize) -> usize {
-        let mut slot_stream = ReadByteStream::new(&self.body[2usize * idx..2usize * idx + 2usize]);
-        to_rust_type!(
-            slot_stream,
-            DataType::SmallInt,
-            DataValue::SmallInt(tuple_offset)
-        );
-        tuple_offset as usize
-    }
-
-    fn page_type(&self) -> PageType {
-        PageType::new(self.get(HeaderElem::PageType))
-    }
-}
+use super::reader::{HeaderElem, PageReader, PageType, PageWriter};
 
 /// Header to tuples to store metadata about the tuple
 #[derive(Debug, PartialEq)]
@@ -190,29 +33,34 @@ impl TupleHeader {
     }
 }
 
+struct Tuple<'a>(&'a [u8]);
+
 /// Tuple structure for leaf page tuples
 #[derive(Debug, PartialEq)]
-struct Tuple {
-    header: TupleHeader,
-    key: Vec<DataValue>,
-    value: Vec<DataValue>,
+struct Tuple<'a> {
+    size: u16,
+    key_size: u16,
+    key: &'a [u8],
+    value: &'a [u8]
+}
+
+
+impl<'a> Tuple<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        todo!()
+    }
 }
 
 /// ScanIterator returns tuples
 struct ScanIterator<'a, R: DBReader> {
     pool: Arc<BufferPool<R>>,
-    page: PageContent<'a>,
-    end_key: &'a [DataValue],
+    page: PageRef<R>,
+    end_key: &'a [u8],
     idx: usize,
 }
 
 impl<'a, R: DBReader> ScanIterator<'a, R> {
-    fn new(
-        pool: Arc<BufferPool<R>>,
-        page: PageContent<'a>,
-        end_key: &'a [DataValue],
-        idx: usize,
-    ) -> Self {
+    fn new(pool: Arc<BufferPool<R>>, page: PageRef<R>, end_key: &'a [u8], idx: usize) -> Self {
         Self {
             pool,
             page,
@@ -223,24 +71,29 @@ impl<'a, R: DBReader> ScanIterator<'a, R> {
 }
 
 impl<'a, R: DBReader> std::iter::Iterator for ScanIterator<'a, R> {
-    type Item = Vec<DataValue>;
+    type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Check if we are out of room for next element. If so, fetch sibling.
-        if self.idx >= self.page.get(HeaderElem::ItemCount) as usize {
-            let ptr = self.page.get(HeaderElem::RightPtr);
-            let bytes = (&**(*self.pool.get_page_ref(ptr).unwrap()).read().unwrap()).to_vec();
-            self.page = PageContent::new(bytes, self.page.key_type, self.page.value_type);
+        // Get read lock for page to check the header
+        let lock = self.page.read().unwrap();
+        let item_count = lock.get_header(HeaderElem::ItemCount) as usize;
+        let ptr = lock.get_header(HeaderElem::RightPtr) as u64;
+        drop(lock);
+
+        if self.idx >= item_count {
+            self.page = self.pool.get_page_ref(ptr as u64).unwrap();
             self.idx = 0;
         }
 
+        let lock = self.page.read().unwrap();
+
         // Get next pair. Check if we are at end.
-        let (key, value) = self.page.element(self.idx);
+        let (key, value) = lock.tuple_unsafe(self.idx);
         self.idx += 1;
-        if key.as_slice() > self.end_key {
+        if key > self.end_key {
             None
         } else {
-            Some(value)
+            Some(value.to_vec())
         }
     }
 }
@@ -251,42 +104,27 @@ struct BTree<R: DBReader> {
 }
 
 impl<R: DBReader> BTree<R> {
-    fn get_content<'a>(
-        &self,
-        page_id: PageID,
-        key_type: &'a [DataType],
-        value_type: &'a [DataType],
-    ) -> PageContent<'a> {
-        // Get page and release lock
-        let page_ref = self.pool.get_page_ref(page_id).unwrap();
-        let lock = page_ref.read().unwrap();
-        PageContent::new((&**lock).to_vec(), key_type, value_type)
-    }
-
-    fn scan<'a>(
+    /// Return an iterator to iterate over tuples in leaf nodes, using sibling pointers to 
+    /// move laterally
+    fn iter_scan<'a>(
         &'a self,
         page_root: PageID,
-        key_type: &'a [DataType],
-        value_type: &'a [DataType],
-        start: &'a [DataValue],
-        end: &'a [DataValue],
+        start: &'a [u8],
+        end: &'a [u8],
     ) -> ScanIterator<'a, R> {
-        // Get leaf page if not leaf page
-        let page = self.get_content(page_root, key_type, value_type);
+        let page = self.pool.get_page_ref(page_root).unwrap();
         let (leaf, _) = self.get_leaf(page, start, Vec::new());
-        let start_idx = leaf
-            .find_key_idx(start, 0, leaf.get(HeaderElem::ItemCount) as usize)
-            .unwrap();
+
+        // Get start index of search in page
+        let start_idx = {
+            let lock = leaf.read().unwrap();
+            lock.find_key(start, 0, lock.get_header(HeaderElem::ItemCount) as usize)
+                .unwrap()
+        };
         ScanIterator::new(Arc::clone(&self.pool), leaf, end, start_idx)
     }
 
-    fn insert_recurs(
-        &self,
-        leaf: PageContent,
-        key: &[DataValue],
-        value: &[DataValue],
-        mut parents: Vec<PageID>,
-    ) {
+    fn insert_recurs(&self, leaf: PageRef<R>, key: &[u8], value: &[u8], mut parents: Vec<PageID>) {
         // If leaf has room, insert. Else, split and insert into parent
         let room = leaf.get(HeaderElem::FreeSpace) as usize;
         let key_size: usize = key.iter().map(|t| t.size()).sum();
@@ -294,14 +132,20 @@ impl<R: DBReader> BTree<R> {
 
         if key_size + value_size + 2usize > room {
             // Split and insert into parent
-            let Some(parent_id) = parents.pop() else {
-                // create new page
-                todo!()
+            let parent_id = match parents.pop() {
+                Some(parent_id) => parent_id,
+                None => {
+                    // Create new page
+                    let new_id = self.pool.new_page();
+                    PageContent::init(&mut self, new_id, PageType::Node);
+
+                    new_id
+                }
             };
 
-            // Splid page
-            todo!()
-            
+            // Split page
+            todo!();
+
             let parent = self.get_content(parent_id, &[DataType::Int], &[DataType::Int]);
             self.insert_recurs(parent, key, value, parents);
         }
@@ -314,39 +158,39 @@ impl<R: DBReader> BTree<R> {
         leaf.insert_data(&bytes);
     }
 
-    fn insert(
-        &self,
-        page_root: PageID,
-        key: &[DataValue],
-        value: &[DataValue],
-        key_type: &[DataType],
-        value_type: &[DataType],
-    ) {
+    fn insert_tuple(&self, page_root: PageID, key: &[u8], value: &[u8]) {
         // Get leaf page if not leaf page
-        let page = self.get_content(page_root, key_type, value_type);
-        let (leaf, parents) = self.get_leaf(page, key, Vec::new());
+        let (leaf, parents) =
+            self.get_leaf(self.pool.get_page_ref(page_root).unwrap(), key, Vec::new());
 
         // Call insert page which will be recursive
         self.insert_recurs(leaf, key, value, parents);
     }
 
+    /// Get the leaf node of the tree containing the given key
     fn get_leaf<'a>(
         &'a self,
-        node: PageContent<'a>,
-        key: &[DataValue],
+        page: PageRef<R>,
+        key: &[u8],
         mut parents: Vec<PageID>,
-    ) -> (PageContent<'a>, Vec<PageID>) {
-        match node.page_type() {
-            PageType::Leaf => (node, parents),
+    ) -> (PageRef<R>, Vec<PageID>) {
+        let page_type = {
+            let lock = page.read().unwrap();
+            PageType::new(lock.get_header(HeaderElem::PageType).into())
+        };
+        match page_type {
+            PageType::Leaf => (page, parents),
             PageType::Node => {
-                let Some(next_id) =
-                    node.find_child(key, 0, node.get(HeaderElem::ItemCount) as usize)
-                else {
-                    panic!() // Node should always return a child. 
+                let (next_id, this_id) = {
+                    let lock = page.read().unwrap();
+                    (
+                        lock.get_header(HeaderElem::RightPtr),
+                        lock.get_header(HeaderElem::PageID),
+                    )
                 };
-                parents.push(node.get(HeaderElem::PageID));
+                parents.push(this_id.into());
                 self.get_leaf(
-                    self.get_content(next_id as u64, node.key_type, node.value_type),
+                    self.pool.get_page_ref(next_id.into()).unwrap(),
                     key,
                     parents,
                 )
