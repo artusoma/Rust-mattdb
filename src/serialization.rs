@@ -176,27 +176,21 @@ impl DataType {
                     .trim_end_matches('\0')
                     .to_owned(),
             )),
-            Self::BigInt => Ok(DataValue::BigInt(i64::from_be_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|e: std::array::TryFromSliceError| {
-                        IntDeserializeError(e.to_string())
-                    })?,
-            ))),
-            Self::Int => Ok(DataValue::Int(i32::from_be_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|e: std::array::TryFromSliceError| {
-                        IntDeserializeError(e.to_string())
-                    })?,
-            ))),
-            Self::SmallInt => Ok(DataValue::SmallInt(i16::from_be_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|e: std::array::TryFromSliceError| {
-                        IntDeserializeError(e.to_string())
-                    })?,
-            ))),
+            Self::BigInt => Ok(DataValue::BigInt(
+                i64::from_be_bytes(bytes.try_into().map_err(
+                    |e: std::array::TryFromSliceError| IntDeserializeError(e.to_string()),
+                )?) ^ 0x8000_0000,
+            )),
+            Self::Int => Ok(DataValue::Int(
+                i32::from_be_bytes(bytes.try_into().map_err(
+                    |e: std::array::TryFromSliceError| IntDeserializeError(e.to_string()),
+                )?) ^ 0x8000,
+            )),
+            Self::SmallInt => Ok(DataValue::SmallInt(
+                i16::from_be_bytes(bytes.try_into().map_err(
+                    |e: std::array::TryFromSliceError| IntDeserializeError(e.to_string()),
+                )?) ^ 0x80,
+            )),
         }
     }
 
@@ -209,19 +203,19 @@ impl DataType {
         use SerializationError::*;
         match (self, data_value) {
             (DataType::BigInt, DataValue::BigInt(x)) => {
-                let bytes: [u8; 8] = x.to_be_bytes();
+                let bytes: [u8; 8] = (x ^ 0x8000_0000).to_be_bytes();
                 let slice: &[u8] = &bytes;
                 stream.write(slice)?;
                 Ok(())
             }
             (DataType::Int, DataValue::Int(x)) => {
-                let bytes: [u8; 4] = x.to_be_bytes();
+                let bytes: [u8; 4] = (x ^ 0x8000).to_be_bytes();
                 let slice: &[u8] = &bytes;
                 stream.write(slice)?;
                 Ok(())
             }
             (DataType::SmallInt, DataValue::SmallInt(x)) => {
-                let bytes: [u8; 2] = x.to_be_bytes();
+                let bytes: [u8; 2] = (x ^ 0x80).to_be_bytes();
                 let slice: &[u8] = &bytes;
                 stream.write(slice)?;
                 Ok(())

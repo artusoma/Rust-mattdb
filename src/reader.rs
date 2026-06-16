@@ -210,6 +210,7 @@ impl PageReader for Page {
     }
 
     fn search_partition(&self, key: &[u8]) -> usize {
+        println!("{:?}", self.pointers());
         self.pointers()
             .partition_point(|&ptr| self.tuple_from_ptr(ptr.into()).unwrap().key() < key)
     }
