@@ -172,7 +172,7 @@ pub trait PageReader {
     fn tuple_from_ptr(&self, ptr: usize) -> Option<&Tuple>;
     fn get_tuple_ptr(&self, slot: usize) -> Option<usize>;
     fn get_slot_ptr(&self, slot: usize) -> Option<usize>;
-    fn pointers(&self) -> &[u16];
+    fn pointers(&self) -> impl std::iter::Iterator<Item = u16>;
     fn search_key(&self, key: &[u8]) -> Option<usize>;
     fn search_partition(&self, key: &[u8]) -> usize;
     fn find_child(&self, key: &[u8]) -> PageID;
@@ -210,15 +210,16 @@ impl PageReader for Page {
     }
 
     fn search_partition(&self, key: &[u8]) -> usize {
-        println!("{:?}", self.pointers());
         self.pointers()
             .partition_point(|&ptr| self.tuple_from_ptr(ptr.into()).unwrap().key() < key)
     }
 
-    fn pointers(&self) -> &[u16] {
+    fn pointers(&self) -> impl std::iter::Iterator<Item = u16> {
         let item_count = self.get_header(HeaderElem::ItemCount) as usize;
         let slot_bytes = &self.0[HEADER_SIZE..HEADER_SIZE + item_count * 2];
-        unsafe { std::slice::from_raw_parts(slot_bytes.as_ptr() as *const u16, item_count) }
+        slot_bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes(c.try_into().unwrap()))
     }
 
     /// Just iterate through page
@@ -311,6 +312,7 @@ impl PageWriter for Page {
         let start_ptr = self.get_slot_ptr(idx).unwrap();
         let end_ptr = self.get_slot_ptr(item_count.try_into().unwrap()).unwrap();
         self.0.copy_within(start_ptr..end_ptr + 2, start_ptr + 2);
+        println!("{}, {}", start_ptr, ptr);
         self.0[start_ptr..start_ptr + 2].copy_from_slice(&(ptr).to_be_bytes());
     }
 
@@ -355,7 +357,7 @@ mod tests {
         let ret_tuple = page.tuple_at(0).unwrap();
         assert_eq!(&*tuple, ret_tuple);
 
-         // Insert tuple 2; should go before 1
+        // Insert tuple 2; should go before 1
         let key = Serializer::serialize_single(&DataType::Int, &DataValue::Int(3)).unwrap();
         let value = Serializer::serialize_single(&DataType::Int, &DataValue::Int(15)).unwrap();
         let tuple = TupleBuf::new(&key, &value);
