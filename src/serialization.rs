@@ -42,7 +42,7 @@ pub enum SerializationError {
 
 /// Stream of bytes to be used in Serializer
 #[derive(Debug)]
-struct WriteByteStream {
+pub struct WriteByteStream {
     buffer: Vec<u8>,
     position: usize,
     length: usize,
@@ -56,6 +56,9 @@ impl WriteByteStream {
             length: size,
         }
     }
+
+    // fn push(&mut self, dtype: DataType, dval: DataValue) -> Result<(), SerializationError> {
+    // }
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), SerializationError> {
         let start = self.position;

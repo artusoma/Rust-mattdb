@@ -17,14 +17,14 @@ pub type PageID = u64;
 pub type Frame = usize;
 
 #[derive(Debug, Clone)]
-pub struct Page {
+pub struct PageSlot {
     page_id: Option<PageID>,
     content: [u8; PAGE_SIZE],
     pins: u64,
     is_dirty: bool,
 }
 
-impl Deref for Page {
+impl Deref for PageSlot {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -34,16 +34,16 @@ impl Deref for Page {
 
 /// DerefMut is going to set the page dirty when something asks for it.
 /// Make sures any mutable call is picked up as dirty.
-impl DerefMut for Page {
+impl DerefMut for PageSlot {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.is_dirty = true;
         &mut self.content
     }
 }
 
-impl Default for Page {
+impl Default for PageSlot {
     fn default() -> Self {
-        Page {
+        PageSlot {
             page_id: None,
             content: [0; PAGE_SIZE],
             pins: 0,
@@ -52,7 +52,7 @@ impl Default for Page {
     }
 }
 
-impl Page {
+impl PageSlot {
     fn load_new(&mut self, page_id: PageID, content: [u8; PAGE_SIZE]) {
         self.content = content;
         self.page_id = Some(page_id);
@@ -62,6 +62,7 @@ impl Page {
 }
 
 /// Fat pointer to BufferPool with page id to be referenced attached
+#[derive(Debug)]
 pub struct PageRef<R: DBReader> {
     pool: Arc<BufferPool<R>>,
     page_id: PageID,
@@ -75,7 +76,7 @@ impl<R: DBReader> Drop for PageRef<R> {
 }
 
 impl<R: DBReader> Deref for PageRef<R> {
-    type Target = RwLock<Page>;
+    type Target = RwLock<PageSlot>;
 
     fn deref(&self) -> &Self::Target {
         self.pool.page(self.page_id)
@@ -180,7 +181,7 @@ impl DiskIO {
 pub struct BufferPool<R: DBReader> {
     /// The vector stays fixed -- no need for a Mutex on `pages` (the Vec) itself. Could be a "boxed slice".
     /// We need a RwLock on each Page, however -- because those threads can change.
-    pages: Vec<RwLock<Page>>,
+    pages: Vec<RwLock<PageSlot>>,
     /// Mapping from page id to frame
     page_table: RwLock<HashMap<PageID, Frame>>,
     /// Least recently used tracker
@@ -192,7 +193,7 @@ pub struct BufferPool<R: DBReader> {
 impl<R: DBReader> BufferPool<R> {
     fn new(disk: R, size: usize) -> Self {
         Self {
-            pages: std::iter::repeat_with(|| RwLock::new(Page::default()))
+            pages: std::iter::repeat_with(|| RwLock::new(PageSlot::default()))
                 .take(size)
                 .collect(),
             page_table: RwLock::new(HashMap::new()),
@@ -201,7 +202,7 @@ impl<R: DBReader> BufferPool<R> {
         }
     }
 
-    fn page(&self, page_id: PageID) -> &RwLock<Page> {
+    fn page(&self, page_id: PageID) -> &RwLock<PageSlot> {
         let page_idx = self.frame(page_id);
         self.pages.get(page_idx).unwrap()
     }
@@ -273,7 +274,7 @@ impl<R: DBReader> BufferPool<R> {
         self.disk_io.read_page(page_id)
     }
 
-    fn write_page(&self, guard: &RwLockWriteGuard<Page>) {
+    fn write_page(&self, guard: &RwLockWriteGuard<PageSlot>) {
         self.disk_io
             .write_page(guard.page_id.unwrap(), &guard.content)
     }
