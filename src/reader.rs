@@ -1,7 +1,7 @@
 use crate::reader::HeaderElem::FreeSpace;
 
 use super::buffer_pool::{PAGE_SIZE, PageID};
-use std::{io::Read, ops::Deref, slice::SliceIndex};
+use std::{cmp::Ordering::Less, io::Read, ops::Deref, slice::SliceIndex};
 
 /// DST representing a tuple in data.
 ///
@@ -168,13 +168,17 @@ pub enum PageWriteError {
 
 pub trait PageReader {
     fn get_header(&self, element: HeaderElem) -> u32;
-    fn tuple_at(&self, idx: usize) -> Option<&Tuple>;
-    fn tuple_from_ptr(&self, ptr: usize) -> Option<&Tuple>;
-    fn get_tuple_ptr(&self, slot: usize) -> Option<usize>;
-    fn get_slot_ptr(&self, slot: usize) -> Option<usize>;
-    fn pointers(&self) -> impl std::iter::Iterator<Item = u16>;
-    fn search_key(&self, key: &[u8]) -> Option<usize>;
-    fn search_partition(&self, key: &[u8]) -> usize;
+    fn tuple(&self, idx: usize) -> Option<&Tuple>;
+
+    /// Find a key and return the slot idx
+    fn find_key(&self, key: &[u8]) -> Option<usize>;
+    fn find_key_inner(&self, key: &[u8], low: usize, high: usize) -> Option<usize>;
+
+    /// Find where to insert a new key
+    fn find_partition(&self, key: &[u8]) -> usize;
+    fn find_partition_inner(&self, key: &[u8], low: usize, high: usize) -> usize;
+
+    /// This is only for inner nodes
     fn find_child(&self, key: &[u8]) -> PageID;
 }
 
@@ -191,35 +195,51 @@ impl PageReader for Page {
         u32::from_be_bytes(self.0[offset..offset + 4].try_into().unwrap())
     }
 
-    fn tuple_at(&self, idx: usize) -> Option<&Tuple> {
+    fn tuple(&self, idx: usize) -> Option<&Tuple> {
         // Read first u16 / get size
-        let ptr = self.get_tuple_ptr(idx)? as usize;
-        self.tuple_from_ptr(ptr)
-    }
-
-    fn tuple_from_ptr(&self, ptr: usize) -> Option<&Tuple> {
+        let ptr = if self.get_header(HeaderElem::ItemCount) <= idx as u32 {
+            None
+        } else {
+            let slot_ptr = HEADER_SIZE + idx * 2;
+            Some(u16::from_be_bytes(self.0[slot_ptr..slot_ptr + 2].try_into().unwrap()) as usize)
+        }?;
         let tuple_size = u16::from_be_bytes(self.0[ptr..ptr + 2].try_into().unwrap()) as usize;
         Some(Tuple::from_bytes(&self.0[ptr..ptr + tuple_size]))
     }
 
-    /// Get slot number corresponding to a key.
-    fn search_key(&self, key: &[u8]) -> Option<usize> {
-        self.pointers()
-            .binary_search_by(|&ptr| self.tuple_from_ptr(ptr.into()).unwrap().key().cmp(key))
-            .ok()
+    fn find_key(&self, key: &[u8]) -> Option<usize> {
+        let count = self.get_header(HeaderElem::ItemCount);
+        if count == 0 {
+            None
+        } else {
+            self.find_key_inner(key, 0, self.get_header(HeaderElem::ItemCount) as usize - 1)
+        }
     }
 
-    fn search_partition(&self, key: &[u8]) -> usize {
-        self.pointers()
-            .partition_point(|&ptr| self.tuple_from_ptr(ptr.into()).unwrap().key() < key)
-    }
+    fn find_key_inner(&self, key: &[u8], low: usize, high: usize) -> Option<usize> {
+        let idx = low + (high - low) / 2;
 
-    fn pointers(&self) -> impl std::iter::Iterator<Item = u16> {
-        let item_count = self.get_header(HeaderElem::ItemCount) as usize;
-        let slot_bytes = &self.0[HEADER_SIZE..HEADER_SIZE + item_count * 2];
-        slot_bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes(c.try_into().unwrap()))
+        if high == low {
+            return if key == self.tuple(high).unwrap().key() {
+                Some(high)
+            } else {
+                None
+            };
+        }
+
+        let this_key = self.tuple(idx).unwrap().key();
+
+        match this_key.cmp(key) {
+            std::cmp::Ordering::Equal => Some(idx),
+            std::cmp::Ordering::Less => self.find_key_inner(key, idx + 1, high),
+            std::cmp::Ordering::Greater => {
+                if idx == 0 {
+                    return None;
+                } else {
+                    self.find_key_inner(key, low, idx - 1)
+                }
+            }
+        }
     }
 
     /// Just iterate through page
@@ -250,17 +270,37 @@ impl PageReader for Page {
         }
     }
 
-    fn get_tuple_ptr(&self, slot: usize) -> Option<usize> {
-        if self.get_header(HeaderElem::ItemCount) < slot as u32 {
-            None
+    fn find_partition(&self, key: &[u8]) -> usize {
+        let count = self.get_header(HeaderElem::ItemCount);
+        if count == 0 {
+            0
         } else {
-            let slot_ptr = self.get_slot_ptr(slot).unwrap();
-            Some(u16::from_be_bytes(self.0[slot_ptr..slot_ptr + 2].try_into().unwrap()) as usize)
+            self.find_partition_inner(key, 0, self.get_header(HeaderElem::ItemCount) as usize - 1)
         }
     }
 
-    fn get_slot_ptr(&self, slot: usize) -> Option<usize> {
-        Some(HEADER_SIZE + slot * 2)
+    fn find_partition_inner(&self, key: &[u8], low: usize, high: usize) -> usize {
+        let idx = low + (high - low) / 2;
+
+        let this_key = self.tuple(idx).unwrap().key();
+        if high == low {
+            match this_key.cmp(key) {
+                std::cmp::Ordering::Less => idx + 1,
+                _ => idx,
+            }
+        } else {
+            match this_key.cmp(key) {
+                std::cmp::Ordering::Equal => self.find_partition_inner(key, low, idx),
+                std::cmp::Ordering::Less => self.find_partition_inner(key, idx + 1, high),
+                std::cmp::Ordering::Greater => {
+                    if idx == 0 {
+                        0
+                    } else {
+                        self.find_partition_inner(key, low, idx - 1)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -289,7 +329,7 @@ impl PageWriter for Page {
         let tuple_write_ptr = self.get_header(HeaderElem::FreeSpacePtr) as usize - data.len();
 
         // Find slot write idx
-        let slot_write_idx = self.search_partition(data.key());
+        let slot_write_idx = self.find_partition(data.key());
 
         // I think the safest order is probably write out Tuple, then Slot, then update headers?
         // Write first
@@ -308,12 +348,13 @@ impl PageWriter for Page {
 
     fn write_slot_at(&mut self, idx: usize, ptr: u16) {
         // Move everything over
-        let item_count = self.get_header(HeaderElem::ItemCount);
-        let start_ptr = self.get_slot_ptr(idx).unwrap();
-        let end_ptr = self.get_slot_ptr(item_count.try_into().unwrap()).unwrap();
-        self.0.copy_within(start_ptr..end_ptr + 2, start_ptr + 2);
-        println!("{}, {}", start_ptr, ptr);
-        self.0[start_ptr..start_ptr + 2].copy_from_slice(&(ptr).to_be_bytes());
+        let item_count = self.get_header(HeaderElem::ItemCount) as usize;
+        let start_ptr = HEADER_SIZE + idx * 2;
+        if item_count > 0 {
+            let end_ptr = HEADER_SIZE + (item_count - 1) * 2;
+            self.0.copy_within(start_ptr..end_ptr + 2, start_ptr + 2);
+        }
+        self.0[start_ptr..start_ptr + 2].copy_from_slice(&ptr.to_be_bytes());
     }
 
     fn set_header(&mut self, element: HeaderElem, value: u32) {
@@ -354,7 +395,7 @@ mod tests {
         assert!(page.insert(&tuple).is_ok());
 
         // Assert looks good
-        let ret_tuple = page.tuple_at(0).unwrap();
+        let ret_tuple = page.tuple(0).unwrap();
         assert_eq!(&*tuple, ret_tuple);
 
         // Insert tuple 2; should go before 1
@@ -364,7 +405,17 @@ mod tests {
         assert!(page.insert(&tuple).is_ok());
 
         // Assert looks good
-        let ret_tuple = page.tuple_at(0).unwrap();
+        let ret_tuple = page.tuple(0).unwrap();
+        assert_eq!(&*tuple, ret_tuple);
+
+        // Insert tuple 3; should go after 2
+        let key = Serializer::serialize_single(&DataType::Int, &DataValue::Int(100)).unwrap();
+        let value = Serializer::serialize_single(&DataType::Int, &DataValue::Int(15)).unwrap();
+        let tuple = TupleBuf::new(&key, &value);
+        assert!(page.insert(&tuple).is_ok());
+
+        // Assert looks good
+        let ret_tuple = page.tuple(2).unwrap();
         assert_eq!(&*tuple, ret_tuple)
     }
 }
