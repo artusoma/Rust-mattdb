@@ -21,7 +21,7 @@ impl Key {
     }
 }
 
-struct KeyBuf {
+pub struct KeyBuf {
     bytes: Vec<u8>,
 }
 
