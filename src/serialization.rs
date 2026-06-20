@@ -155,9 +155,13 @@ impl std::fmt::Display for DataValue {
 /// Will handle the serialization and deserialization of data
 #[derive(Debug, PartialEq, Clone)]
 pub enum DataType {
+    /// Fixed size character
     Char(usize),
+    /// Big int corresponds to i64, using 8 bytes
     BigInt,
+    /// Int corresponds to i32, using 4 bytes
     Int,
+    /// Small int corresponds to i16, using 2 bytes
     SmallInt,
 }
 
