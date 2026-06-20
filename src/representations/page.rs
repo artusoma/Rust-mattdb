@@ -1,12 +1,55 @@
 use super::tuple::*;
 use crate::buffer_pool::{PAGE_SIZE, PageID};
 
+pub enum HeaderElem {
+    PageID,
+    PageType,
+    FreeSpace,
+    LastCommit,
+    ItemCount,
+    LeftPtr,
+    RightPtr,
+    FreeSpacePtr,
+    LeftChildPtr,
+}
+
+impl HeaderElem {
+    fn offset(&self) -> usize {
+        match self {
+            Self::PageID => 0,
+            Self::PageType => 4,
+            Self::FreeSpace => 8,
+            Self::LastCommit => 12,
+            Self::ItemCount => 16,
+            Self::LeftPtr => 20,
+            Self::RightPtr => 24,
+            Self::FreeSpacePtr => 28,
+            Self::LeftChildPtr => 32,
+        }
+    }
+}
+
+pub fn get_page_type(bytes: &[u8]) -> PageType {
+    let offset = HeaderElem::PageType.offset();
+    let type_id = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    PageType::new(type_id)
+}
+
+const HEADER_SIZE: usize = 4 * 9;
+
 pub trait PageRepr {
     fn from_bytes(bytes: &[u8]) -> &Self;
     fn from_bytes_mut(bytes: &mut [u8]) -> &mut Self;
     fn get_header(&self, element: HeaderElem) -> u32;
     fn set_header(&mut self, element: HeaderElem, value: u32);
-    fn init(&mut self, page_id: PageID, page_type: PageType, left_ptr: PageID, right_ptr: PageID);
+    fn init(
+        &mut self,
+        page_id: PageID,
+        page_type: PageType,
+        left_ptr: PageID,
+        right_ptr: PageID,
+        left_child_ptr: Option<PageID>,
+    );
 }
 
 macro_rules! impl_page_repr {
@@ -36,6 +79,7 @@ macro_rules! impl_page_repr {
                 page_type: PageType,
                 left_ptr: PageID,
                 right_ptr: PageID,
+                left_child_ptr: Option<u64>,
             ) {
                 self.set_header(HeaderElem::PageID, page_id.try_into().unwrap());
                 self.set_header(HeaderElem::PageType, page_type.id().try_into().unwrap());
@@ -47,6 +91,10 @@ macro_rules! impl_page_repr {
                 self.set_header(HeaderElem::LeftPtr, left_ptr.try_into().unwrap());
                 self.set_header(HeaderElem::RightPtr, right_ptr.try_into().unwrap());
                 self.set_header(HeaderElem::FreeSpacePtr, PAGE_SIZE.try_into().unwrap());
+
+                if let Some(x) = left_child_ptr {
+                    self.set_header(HeaderElem::LeftChildPtr, x.try_into().unwrap())
+                };
             }
         }
     };
@@ -89,40 +137,6 @@ impl PageType {
         }
     }
 }
-
-pub enum HeaderElem {
-    PageID,
-    PageType,
-    FreeSpace,
-    LastCommit,
-    ItemCount,
-    LeftPtr,
-    RightPtr,
-    FreeSpacePtr,
-}
-
-impl HeaderElem {
-    fn offset(&self) -> usize {
-        match self {
-            Self::PageID => 0,
-            Self::PageType => 4,
-            Self::FreeSpace => 8,
-            Self::LastCommit => 12,
-            Self::ItemCount => 16,
-            Self::LeftPtr => 20,
-            Self::RightPtr => 24,
-            Self::FreeSpacePtr => 28,
-        }
-    }
-}
-
-pub fn get_page_type(bytes: &[u8]) -> PageType {
-    let offset = HeaderElem::PageType.offset();
-    let type_id = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
-    PageType::new(type_id)
-}
-
-const HEADER_SIZE: usize = 4 * 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PageWriteError {
@@ -295,17 +309,20 @@ impl Leaf {
 }
 
 impl Node {
-    /// Binary search for child node
     fn find_child(&self, key: &[u8]) -> PageID {
-        todo!()
+        let repr = Leaf::from_bytes(bytes)
     }
 
-    fn find_child_inner(&self, key: &[u8]) -> PageID {
+    fn find_child_inner(&self, key: &[u8], low: usize, high: usize) -> PageID {
         todo!()
     }
 
     fn insert(&self, key: &[u8], page_id: PageID) -> Result<(), PageWriteError> {
-        todo!()
+        // Check we have enough space
+        let free_space = self.get_header(HeaderElem::FreeSpace);
+        if (key.len() + 8usize) > free_space as usize {
+            return Err(PageWriteError::OutOfSpace);
+        }
     }
 
     fn delete(&self, key: &[u8]) {
@@ -337,12 +354,26 @@ mod tests {
         page.init(1, PageType::Leaf, 15, 66);
 
         // Insert tuple 1
-        let tuple = TupleBuf::new(&[0u8], &[1u8]);
-        assert!(page.insert(&tuple).is_ok());
+        let tuple = TupleBuf::new(&[1u8], &[1u8]);
+        page.insert(&tuple).unwrap();
+        assert_eq!(&*tuple, page.tuple(0).unwrap());
 
-        // Assert looks good
-        let ret_tuple = page.tuple(0).unwrap();
-        assert_eq!(&*tuple, ret_tuple);
+        // Insert tuple 2. This should go before 1.
+        let tuple = TupleBuf::new(&[0u8], &[2u8]);
+        page.insert(&tuple).unwrap();
+        assert_eq!(&*tuple, page.tuple(0).unwrap());
 
+        // Delete tuple 2. This should move 1 back to 0.
+        page.delete(&[0u8]).unwrap();
+        let tuple = TupleBuf::new(&[1u8], &[1u8]);
+        assert_eq!(&*tuple, page.tuple(0).unwrap());
     }
+
+    // #[test]
+    // fn page_split() {
+    //     for i in 0..20 as u8 {
+    //         let tuple = TupleBuf::new(&[i], &[i]);
+    //         page.insert(&tuple).unwrap();
+    //     }
+    // }
 }

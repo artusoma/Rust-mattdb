@@ -13,7 +13,7 @@ pub const PAGE_SIZE: usize = 8192;
 const PAGES_IN_MEMORY: usize = 1000;
 
 // Types because I keep getting confused
-pub type PageID = u64;
+pub type PageID = u32;
 pub type Frame = usize;
 
 #[derive(Debug, Clone)]
@@ -168,8 +168,8 @@ impl DiskIO {
         }
     }
 
-    fn offset(&self, page_id: PageID) -> u64 {
-        page_id * PAGE_SIZE as u64
+    fn offset(&self, page_id: PageID) -> usize {
+        page_id as usize * PAGE_SIZE
     }
 }
 
