@@ -83,6 +83,12 @@ impl<R: DBReader> Deref for PageRef<R> {
     }
 }
 
+impl<R: DBReader> PageRef<R> {
+    pub fn id(&self) -> PageID {
+        self.page_id
+    }
+}
+
 /// EvictManager handles evictions
 #[derive(Debug)]
 struct EvictManager {
@@ -302,12 +308,9 @@ mod tests {
     }
 
     impl DBReader for MockReader {
-        fn write_page(&self, _page_id: PageID, _content: &[u8; PAGE_SIZE]) {
-            // Definitely wrote a page here
-        }
+        fn write_page(&self, _page_id: PageID, _content: &[u8; PAGE_SIZE]) {}
 
         fn read_page(&self, _page_id: PageID) -> [u8; PAGE_SIZE] {
-            // Definitely read a real page here, really
             [0u8; PAGE_SIZE]
         }
 

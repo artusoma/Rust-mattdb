@@ -7,7 +7,7 @@
 
 use crate::buffer_pool::{BufferPool, DBReader, PAGE_SIZE, PageID, PageRef};
 use crate::representations::page::{HeaderElem, InnerNode, Leaf, PageType, SlottedPage};
-use crate::representations::tuple::Tuple;
+use crate::representations::tuple::{Tuple, TupleBuf};
 use std::sync::Arc;
 
 /// ScanIterator returns tuples
@@ -38,7 +38,7 @@ impl<'a, R: DBReader> std::iter::Iterator for ScanIterator<'a, R> {
         let lock = self.page.read().unwrap();
         let leaf = Leaf::from_bytes(&lock);
         let item_count = leaf.get_header(HeaderElem::ItemCount) as usize;
-        let ptr = leaf.get_header(HeaderElem::RightPtr);
+        let ptr = leaf.get_header(HeaderElem::RightSiblingPtr);
         drop(lock);
 
         // If we are at end of leaf, grab next page and reset idx
@@ -87,17 +87,21 @@ impl<R: DBReader> BTree<R> {
         ScanIterator::new(Arc::clone(&self.pool), leaf, end, start_idx)
     }
 
-    fn insert_recurs(&self, leaf: PageRef<R>, tuple: &Tuple, mut parents: Vec<PageID>) {
+    fn insert_recurs(&self, page: PageRef<R>, tuple: &Tuple, mut parents: Vec<PageID>) {
+        let read_lock = page.read().unwrap();
+        let page_repr = SlottedPage::from_bytes(&read_lock);
+        let room = page_repr.get_header(HeaderElem::FreeSpace);
+        let page_type = PageType::new(page_repr.get_header(HeaderElem::PageType)).unwrap();
+
         // The required space is the size of the tuple plus the 2 byte slot ptr.
         // Check if we have enough room in the page.
         //
         // If we don't, then we need to:
-        // (1) Split the page 
+        // (1) Split the page
         // (2) Insert a new key into the parent
         // (3) Possibly recurse that
-        let room = Leaf::from_bytes(&leaf.read().unwrap()).get_header(HeaderElem::FreeSpace);
         if tuple.size() as u32 + 2u32 > room {
-            // Split and insert into parent. Check if we had a parent to get the leaf. 
+            // Split and insert into parent. Check if we had a parent to get the leaf.
             // If we did, then use that as the parent id. Otherwise, we need to create a new page
             // and use that newly created page id
             let parent_id = match parents.pop() {
@@ -106,26 +110,55 @@ impl<R: DBReader> BTree<R> {
                     // Create new page
                     let new_id = self.pool.new_page();
                     let new_page = self.pool.get_page_ref(new_id).unwrap();
-                    {
-                        InnerNode::from_bytes_mut(&mut new_page.read().unwrap()).init(new_id, PageType::Leaf, left_ptr, right_ptr, left_child_ptr);
-                    };
+                    InnerNode::from_bytes_mut(&mut new_page.write().unwrap()).init(new_id, 0, 0, 0);
                     new_id
                 }
             };
 
-            // Split page
-            todo!();
+            // Split page, updating sibling pointers
+            let new_sibling_id = self.pool.new_page();
+            let new_sibling_page = self.pool.get_page_ref(new_sibling_id).unwrap();
 
-            let parent = self.get_content(parent_id, &[DataType::Int], &[DataType::Int]);
-            self.insert_recurs(parent, key, value, parents);
+            match page_type {
+                PageType::Leaf => Leaf::from_bytes_mut(&mut new_sibling_page.write().unwrap())
+                    .init(
+                        new_sibling_id,
+                        page.id(),
+                        page_repr.get_header(HeaderElem::RightSiblingPtr),
+                    ),
+                PageType::Node => InnerNode::from_bytes_mut(&mut new_sibling_page.write().unwrap())
+                    .init(
+                        new_sibling_id,
+                        page.id(),
+                        page_repr.get_header(HeaderElem::RightSiblingPtr),
+                        0,
+                    ),
+            }
+
+            drop(read_lock);
+
+            let mut write_lock = page.write().unwrap();
+            let page_repr = SlottedPage::from_bytes_mut(&mut write_lock);
+
+            let mut new_write_lock = new_sibling_page.write().unwrap();
+            let new_page_repr = SlottedPage::from_bytes_mut(&mut new_write_lock);
+
+            for moved_tuple in page_repr.split_half().iter() {
+                new_page_repr.insert(&moved_tuple).unwrap();
+            }
+
+            // Update current page to point to new sibling on right
+
+            // Push new key into parent, which will be tuple at index 0 of new page
+            let new_key = new_page_repr.tuple(0).unwrap().key();
+            let pointer = TupleBuf::new(new_key, &new_sibling_id.to_be_bytes());
+
+            let parent = self.pool.get_page_ref(parent_id).unwrap();
+            self.insert_recurs(parent, &pointer, parents);
         }
 
-        // Serialize and hand off
-        let key_bytes = Serializer::serialize(leaf.key_type, key).unwrap();
-        let value_bytes = Serializer::serialize(leaf.value_type, value).unwrap();
-        let mut bytes = key_bytes;
-        bytes.extend(value_bytes);
-        leaf.insert_data(&bytes);
+        // There is room - we can insert into the leaf
+        Leaf::from_bytes_mut(&mut page.write().unwrap()).insert(tuple).unwrap();
     }
 
     fn insert_tuple(&self, page_root: PageID, tuple: &Tuple) {
@@ -136,7 +169,7 @@ impl<R: DBReader> BTree<R> {
             Vec::new(),
         );
 
-        // Call insert page which will be recursive
+        // Call insert page which may become recursive if parents need to be split
         self.insert_recurs(leaf, tuple, parents);
     }
 
@@ -149,7 +182,7 @@ impl<R: DBReader> BTree<R> {
     ) -> (PageRef<R>, Vec<PageID>) {
         let page_type = {
             let lock = page.read().unwrap();
-            PageType::new(SlottedPage::from_bytes(&lock).get_header(HeaderElem::PageType))
+            PageType::new(SlottedPage::from_bytes(&lock).get_header(HeaderElem::PageType)).unwrap()
         };
         match page_type {
             PageType::Leaf => (page, parents),
@@ -158,7 +191,7 @@ impl<R: DBReader> BTree<R> {
                     let lock = page.read().unwrap();
                     let repr = SlottedPage::from_bytes(&lock);
                     (
-                        repr.get_header(HeaderElem::RightPtr),
+                        repr.get_header(HeaderElem::RightSiblingPtr),
                         repr.get_header(HeaderElem::PageID),
                     )
                 };

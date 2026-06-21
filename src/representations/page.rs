@@ -4,11 +4,13 @@ use super::tuple::*;
 use crate::buffer_pool::{PAGE_SIZE, PageID};
 
 #[derive(Debug, thiserror::Error)]
-pub enum PageWriteError {
+pub enum PageReadWriteError {
     #[error("Page is out of space for insert")]
     OutOfSpace,
     #[error("Cannot find specified key (bytes: {0})")]
     KeyNotFound(String),
+    #[error("Page type error: cannot interpret page type `{0}`")]
+    PageTypeError(u32),
 }
 
 pub enum HeaderElem {
@@ -17,8 +19,8 @@ pub enum HeaderElem {
     FreeSpace,
     LastCommit,
     ItemCount,
-    LeftPtr,
-    RightPtr,
+    LeftSiblingPtr,
+    RightSiblingPtr,
     FreeSpacePtr,
     LeftChildPtr,
 }
@@ -31,18 +33,12 @@ impl HeaderElem {
             Self::FreeSpace => 8,
             Self::LastCommit => 12,
             Self::ItemCount => 16,
-            Self::LeftPtr => 20,
-            Self::RightPtr => 24,
+            Self::LeftSiblingPtr => 20,
+            Self::RightSiblingPtr => 24,
             Self::FreeSpacePtr => 28,
             Self::LeftChildPtr => 32,
         }
     }
-}
-
-pub fn get_page_type(bytes: &[u8]) -> PageType {
-    let offset = HeaderElem::PageType.offset();
-    let type_id = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
-    PageType::new(type_id)
 }
 
 const HEADER_SIZE: usize = 4 * 9;
@@ -64,12 +60,20 @@ impl PageType {
         }
     }
 
-    pub fn new(type_id: u32) -> Self {
+    pub fn new(type_id: u32) -> Result<Self, PageReadWriteError> {
         match type_id {
-            0 => Self::Node,
-            1 => Self::Leaf,
-            _ => panic!(),
+            0 => Ok(Self::Node),
+            1 => Ok(Self::Leaf),
+            _ => Err(PageReadWriteError::PageTypeError(type_id)),
         }
+    }
+}
+
+impl TryFrom<u32> for PageType {
+    type Error = PageReadWriteError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        PageType::new(value)
     }
 }
 
@@ -96,6 +100,11 @@ impl SlottedPage {
         self.0[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
     }
 
+    pub fn percent_full(&self) -> u8 {
+        100 - (self.get_header(HeaderElem::FreeSpace) as usize * 100 / (PAGE_SIZE - HEADER_SIZE))
+            as u8
+    }
+
     pub fn init(
         &mut self,
         page_id: PageID,
@@ -111,8 +120,8 @@ impl SlottedPage {
             (PAGE_SIZE - HEADER_SIZE).try_into().unwrap(),
         ); // 2 bytes for first slot
         self.set_header(HeaderElem::ItemCount, 0);
-        self.set_header(HeaderElem::LeftPtr, left_ptr.try_into().unwrap());
-        self.set_header(HeaderElem::RightPtr, right_ptr.try_into().unwrap());
+        self.set_header(HeaderElem::LeftSiblingPtr, left_ptr.try_into().unwrap());
+        self.set_header(HeaderElem::RightSiblingPtr, right_ptr.try_into().unwrap());
         self.set_header(HeaderElem::FreeSpacePtr, PAGE_SIZE.try_into().unwrap());
 
         if let Some(x) = left_child_ptr {
@@ -183,6 +192,7 @@ impl SlottedPage {
         if high == low {
             match this_key.cmp(key) {
                 std::cmp::Ordering::Less => idx + 1,
+                std::cmp::Ordering::Equal => idx + 1,
                 _ => idx,
             }
         } else {
@@ -200,11 +210,11 @@ impl SlottedPage {
         }
     }
 
-    pub fn insert(&mut self, data: &Tuple) -> Result<(), PageWriteError> {
+    pub fn insert(&mut self, data: &Tuple) -> Result<(), PageReadWriteError> {
         // First, check free space
         let free_space = self.get_header(HeaderElem::FreeSpace);
         if (data.len() + 2usize) > free_space as usize {
-            return Err(PageWriteError::OutOfSpace);
+            return Err(PageReadWriteError::OutOfSpace);
         }
 
         // Get slot write ptr and tuple write ptr
@@ -221,7 +231,7 @@ impl SlottedPage {
 
         // Update header
         let item_count = self.get_header(HeaderElem::ItemCount);
-        self.set_header(HeaderElem::FreeSpace, free_space - data.len() as u32);
+        self.set_header(HeaderElem::FreeSpace, free_space - data.len() as u32 - 2);
         self.set_header(HeaderElem::FreeSpacePtr, tuple_write_ptr as u32);
         self.set_header(HeaderElem::ItemCount, item_count + 1);
 
@@ -239,20 +249,22 @@ impl SlottedPage {
         self.0[start_ptr..start_ptr + 2].copy_from_slice(&ptr.to_be_bytes());
     }
 
-    pub fn delete(&mut self, key: &[u8]) -> Result<(), PageWriteError> {
+    pub fn delete(&mut self, key: &[u8]) -> Result<(), PageReadWriteError> {
         let delete_idx = self
             .find_key(key)
-            .ok_or(PageWriteError::KeyNotFound(format!("{:?}", key)))?;
+            .ok_or(PageReadWriteError::KeyNotFound(format!("{:?}", key)))?;
 
         // Set new item count
         let current_count = self.get_header(HeaderElem::ItemCount);
         self.set_header(HeaderElem::ItemCount, current_count - 1);
 
-        // Move everything over to cover now deleted key
+        // Move everything over to cover now deleted key.
+        // The `end_ptr` maps from current item count to copy end.
+        // Ex: if 1 item, then the end_ptr will be 2.
         if current_count > 1 {
             let start_ptr = HEADER_SIZE + delete_idx * 2;
             let end_ptr = HEADER_SIZE + current_count as usize * 2;
-            self.0.copy_within(start_ptr..end_ptr + 2, start_ptr - 2);
+            self.0.copy_within(start_ptr..end_ptr, start_ptr - 2);
         };
         Ok(())
     }
@@ -263,7 +275,7 @@ impl SlottedPage {
         let split_idx = item_count / 2;
 
         // Grab tuples that will go right
-        let mut tuples: Vec<TupleBuf> = Vec::new();
+        let mut tuples: Vec<TupleBuf> = Vec::with_capacity(item_count);
         for idx in split_idx..item_count {
             tuples.push(self.tuple(idx).unwrap().to_owned());
         }
@@ -271,10 +283,17 @@ impl SlottedPage {
         // Create new temporary page to copy left into, then replace self.0
         let mut temp_bytes = [0u8; PAGE_SIZE];
         let temp = SlottedPage::from_bytes_mut(&mut temp_bytes);
+        temp.init(
+            self.get_header(HeaderElem::PageID),
+            self.get_header(HeaderElem::PageType).try_into().unwrap(), // unwrap; cannot fail
+            self.get_header(HeaderElem::LeftSiblingPtr),
+            self.get_header(HeaderElem::RightSiblingPtr),
+            Some(self.get_header(HeaderElem::LeftSiblingPtr)),
+        );
         for idx in 0..split_idx {
             temp.insert(self.tuple(idx).unwrap()).unwrap();
         }
-        self.0[HEADER_SIZE..PAGE_SIZE].copy_from_slice(&temp.0[HEADER_SIZE..PAGE_SIZE]);
+        self.0[0..PAGE_SIZE].copy_from_slice(&temp.0[0..PAGE_SIZE]);
 
         // Return tuples
         tuples
@@ -296,13 +315,9 @@ impl Leaf {
         unsafe { &mut *(bytes as *mut [u8] as *mut SlottedPage as *mut Leaf) }
     }
 
-    pub fn init(
-        &mut self,
-        page_id: PageID,
-        left_ptr: PageID,
-        right_ptr: PageID,
-    ) {
-        self.0.init(page_id, PageType::Leaf, left_ptr, right_ptr, None);
+    pub fn init(&mut self, page_id: PageID, left_ptr: PageID, right_ptr: PageID) {
+        self.0
+            .init(page_id, PageType::Leaf, left_ptr, right_ptr, None);
     }
 }
 
@@ -336,7 +351,7 @@ impl InnerNode {
         unsafe { &mut *(bytes as *mut [u8] as *mut SlottedPage as *mut InnerNode) }
     }
 
-    pub fn insert(&mut self, key: &[u8], page_id: PageID) -> Result<(), PageWriteError> {
+    pub fn insert(&mut self, key: &[u8], page_id: PageID) -> Result<(), PageReadWriteError> {
         // construct tuple
         let t = TupleBuf::new(key, &page_id.to_be_bytes());
         self.0.insert(&t)
@@ -357,11 +372,182 @@ impl InnerNode {
             Some(left_child_ptr),
         );
     }
+
+    /// Get the next child page in the search for `key`
+    ///
+    /// If we use base find partition, then we get an index back.
+    /// We actually need to shift everything back one.
+    ///
+    /// Say we have twos keys (4, 7).
+    /// - If `key = 2` => `left_child_ptr`  , but `find_partition` returns `0`
+    /// - If `key = 4` => value at `idx = 0`, but `find_partition` returns `1`
+    /// - If `key = 5` => value at `idx = 0`, but `find_partition` returns `1`
+    /// - If `key = 7` => value at `idx = 1`, but `find_partition` returns `2`
+    pub fn child(&self, key: &[u8]) -> PageID {
+        let found_idx = self.0.find_partition(key);
+        if found_idx == 0 {
+            self.0.get_header(HeaderElem::LeftChildPtr)
+        } else {
+            u32::from_be_bytes(
+                self.0
+                    .tuple(found_idx - 1)
+                    .unwrap()
+                    .value()
+                    .try_into()
+                    .unwrap(),
+            )
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Helper: create an initialized InnerNode from a stack buffer
+    // -----------------------------------------------------------------------
+    fn make_inner_node(
+        bytes: &mut [u8; PAGE_SIZE],
+        page_id: PageID,
+        left_child_ptr: PageID,
+    ) -> &mut InnerNode {
+        let node = InnerNode::from_bytes_mut(bytes);
+        node.init(page_id, 0, 0, left_child_ptr);
+        node
+    }
+
+    // -----------------------------------------------------------------------
+    // InnerNode::child — Base Tests
+    // -----------------------------------------------------------------------
+
+    /// With keys [4, 7] and a key less than both, child() must return left_child_ptr.
+    ///
+    /// Tree picture:  left_child_ptr | 4 => page_a | 7 => page_b
+    /// key = 2 falls left of everything => left_child_ptr (10).
+    #[test]
+    fn child_key_less_than_all_keys() {
+        let mut bytes = [0u8; PAGE_SIZE];
+        let node = make_inner_node(&mut bytes, 1, 10);
+        node.insert(&[4u8], 20).unwrap();
+        node.insert(&[7u8], 30).unwrap();
+
+        assert_eq!(10, node.child(&[2u8]));
+    }
+
+    /// With keys [4, 7], key == 4 should follow the child pointer stored *with* key 4
+    /// (page 20), not the left_child_ptr.
+    ///
+    /// B-tree convention: an inner-node key k means "all keys >= k go right".
+    #[test]
+    fn child_key_equal_to_first_key() {
+        let mut bytes = [0u8; PAGE_SIZE];
+        let node = make_inner_node(&mut bytes, 1, 10);
+        node.insert(&[4u8], 20).unwrap();
+        node.insert(&[7u8], 30).unwrap();
+
+        assert_eq!(20, node.child(&[4u8]));
+    }
+
+    /// With keys [4, 7], key = 5 lies between the two keys.
+    /// It belongs in the same child as key 4's right side (page 20).
+    #[test]
+    fn child_key_between_keys() {
+        let mut bytes = [0u8; PAGE_SIZE];
+        let node = make_inner_node(&mut bytes, 1, 10);
+        node.insert(&[4u8], 20).unwrap();
+        node.insert(&[7u8], 30).unwrap();
+
+        assert_eq!(20, node.child(&[5u8]));
+    }
+
+    /// With keys [4, 7], key == 7 should return the child pointer stored with key 7 (page 30).
+    #[test]
+    fn child_key_equal_to_last_key() {
+        let mut bytes = [0u8; PAGE_SIZE];
+        let node = make_inner_node(&mut bytes, 1, 10);
+        node.insert(&[4u8], 20).unwrap();
+        node.insert(&[7u8], 30).unwrap();
+
+        assert_eq!(30, node.child(&[7u8]));
+    }
+
+    /// With keys [4, 7], key = 9 is greater than all keys.
+    /// It should still follow the rightmost child pointer (page 30, stored with key 7).
+    #[test]
+    fn child_key_greater_than_all_keys() {
+        let mut bytes = [0u8; PAGE_SIZE];
+        let node = make_inner_node(&mut bytes, 1, 10);
+        node.insert(&[4u8], 20).unwrap();
+        node.insert(&[7u8], 30).unwrap();
+
+        assert_eq!(30, node.child(&[9u8]));
+    }
+
+    // -----------------------------------------------------------------------
+    // InnerNode::child — Edge Case Tests
+    // -----------------------------------------------------------------------
+
+    /// An empty inner node has no separator keys. Any lookup must return left_child_ptr.
+    #[test]
+    fn child_empty_node_returns_left_child_ptr() {
+        let mut bytes = [0u8; PAGE_SIZE];
+        let node = make_inner_node(&mut bytes, 1, 99);
+
+        // Regardless of key, the only known child is left_child_ptr.
+        assert_eq!(99, node.child(&[0u8]));
+        assert_eq!(99, node.child(&[255u8]));
+    }
+
+    /// Single key: lookup with key < the only separator returns left_child_ptr.
+    #[test]
+    fn child_single_key_less_than_separator() {
+        let mut bytes = [0u8; PAGE_SIZE];
+        let node = make_inner_node(&mut bytes, 1, 10);
+        node.insert(&[5u8], 20).unwrap();
+
+        assert_eq!(10, node.child(&[3u8]));
+    }
+
+    /// Single key: lookup with key == the separator returns the child stored with that key.
+    #[test]
+    fn child_single_key_equal_to_separator() {
+        let mut bytes = [0u8; PAGE_SIZE];
+        let node = make_inner_node(&mut bytes, 1, 10);
+        node.insert(&[5u8], 20).unwrap();
+
+        assert_eq!(20, node.child(&[5u8]));
+    }
+
+    /// Single key: lookup with key > the separator returns the child stored with that key.
+    #[test]
+    fn child_single_key_greater_than_separator() {
+        let mut bytes = [0u8; PAGE_SIZE];
+        let node = make_inner_node(&mut bytes, 1, 10);
+        node.insert(&[5u8], 20).unwrap();
+
+        assert_eq!(20, node.child(&[8u8]));
+    }
+
+    /// Multi-byte keys: verify routing still works correctly when keys are wider than one byte.
+    #[test]
+    fn child_multi_byte_key_routing() {
+        let mut bytes = [0u8; PAGE_SIZE];
+        let node = make_inner_node(&mut bytes, 1, 10);
+        // Insert separator key [0, 100] => page 20
+        node.insert(&[0u8, 100u8], 20).unwrap();
+
+        // key [0, 50] is less than [0, 100] => left_child_ptr
+        assert_eq!(10, node.child(&[0u8, 50u8]));
+        // key [0, 100] equals separator => page 20
+        assert_eq!(20, node.child(&[0u8, 100u8]));
+        // key [0, 200] is greater => page 20
+        assert_eq!(20, node.child(&[0u8, 200u8]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Existing tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn new_page() {
@@ -372,7 +558,7 @@ mod tests {
         assert_eq!(1, page.get_header(HeaderElem::PageID));
         assert_eq!(
             PageType::Leaf,
-            PageType::new(page.get_header(HeaderElem::PageType))
+            PageType::new(page.get_header(HeaderElem::PageType)).unwrap()
         );
     }
 
@@ -380,7 +566,7 @@ mod tests {
     fn tuple_insert() {
         let mut bytes = vec![0u8; PAGE_SIZE];
         let page = Leaf::from_bytes_mut(&mut bytes);
-        page.init(1,  15, 66);
+        page.init(1, 15, 66);
 
         // Insert tuple 1
         let tuple = TupleBuf::new(&[1u8], &[1u8]);
@@ -397,12 +583,4 @@ mod tests {
         let tuple = TupleBuf::new(&[1u8], &[1u8]);
         assert_eq!(&*tuple, page.tuple(0).unwrap());
     }
-
-    // #[test]
-    // fn page_split() {
-    //     for i in 0..20 as u8 {
-    //         let tuple = TupleBuf::new(&[i], &[i]);
-    //         page.insert(&tuple).unwrap();
-    //     }
-    // }
 }
