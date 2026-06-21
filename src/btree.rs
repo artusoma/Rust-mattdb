@@ -97,14 +97,18 @@ impl<R: DBReader> BTree<R> {
         // (3) Possibly recurse that
         let room = Leaf::from_bytes(&leaf.read().unwrap()).get_header(HeaderElem::FreeSpace);
         if tuple.size() as u32 + 2u32 > room {
-            // Split and insert into parent
+            // Split and insert into parent. Check if we had a parent to get the leaf. 
+            // If we did, then use that as the parent id. Otherwise, we need to create a new page
+            // and use that newly created page id
             let parent_id = match parents.pop() {
                 Some(parent_id) => parent_id,
                 None => {
                     // Create new page
                     let new_id = self.pool.new_page();
-                    PageContent::init(&mut self, new_id, PageType::Node);
-
+                    let new_page = self.pool.get_page_ref(new_id).unwrap();
+                    {
+                        InnerNode::from_bytes_mut(&mut new_page.read().unwrap()).init(new_id, PageType::Leaf, left_ptr, right_ptr, left_child_ptr);
+                    };
                     new_id
                 }
             };

@@ -299,11 +299,10 @@ impl Leaf {
     pub fn init(
         &mut self,
         page_id: PageID,
-        page_type: PageType,
         left_ptr: PageID,
         right_ptr: PageID,
     ) {
-        self.0.init(page_id, page_type, left_ptr, right_ptr, None);
+        self.0.init(page_id, PageType::Leaf, left_ptr, right_ptr, None);
     }
 }
 
@@ -346,14 +345,13 @@ impl InnerNode {
     pub fn init(
         &mut self,
         page_id: PageID,
-        page_type: PageType,
         left_ptr: PageID,
         right_ptr: PageID,
         left_child_ptr: PageID,
     ) {
         self.0.init(
             page_id,
-            page_type,
+            PageType::Node,
             left_ptr,
             right_ptr,
             Some(left_child_ptr),
@@ -369,7 +367,7 @@ mod tests {
     fn new_page() {
         let mut bytes = vec![0u8; PAGE_SIZE];
         let page = Leaf::from_bytes_mut(&mut bytes);
-        page.init(1, PageType::Leaf, 15, 66);
+        page.init(1, 15, 66);
 
         assert_eq!(1, page.get_header(HeaderElem::PageID));
         assert_eq!(
@@ -382,7 +380,7 @@ mod tests {
     fn tuple_insert() {
         let mut bytes = vec![0u8; PAGE_SIZE];
         let page = Leaf::from_bytes_mut(&mut bytes);
-        page.init(1, PageType::Leaf, 15, 66);
+        page.init(1,  15, 66);
 
         // Insert tuple 1
         let tuple = TupleBuf::new(&[1u8], &[1u8]);
