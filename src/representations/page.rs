@@ -53,7 +53,7 @@ pub enum PageType {
 }
 
 impl PageType {
-    pub fn id(&self) -> u64 {
+    pub fn id(&self) -> u32 {
         match self {
             Self::Node => 0,
             Self::Leaf => 1,
@@ -288,7 +288,7 @@ impl SlottedPage {
             self.get_header(HeaderElem::PageType).try_into().unwrap(), // unwrap; cannot fail
             self.get_header(HeaderElem::LeftSiblingPtr),
             self.get_header(HeaderElem::RightSiblingPtr),
-            Some(self.get_header(HeaderElem::LeftSiblingPtr)),
+            Some(self.get_header(HeaderElem::LeftChildPtr)),
         );
         for idx in 0..split_idx {
             temp.insert(self.tuple(idx).unwrap()).unwrap();
