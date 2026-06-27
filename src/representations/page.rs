@@ -351,8 +351,10 @@ impl InnerNode {
         unsafe { &mut *(bytes as *mut [u8] as *mut SlottedPage as *mut InnerNode) }
     }
 
+    /// A wrapper of the base SlottedPage insert.
+    /// 
+    /// Creates a new tuple from a page_id that will be the new child. 
     pub fn insert(&mut self, key: &[u8], page_id: PageID) -> Result<(), PageReadWriteError> {
-        // construct tuple
         let t = TupleBuf::new(key, &page_id.to_be_bytes());
         self.0.insert(&t)
     }

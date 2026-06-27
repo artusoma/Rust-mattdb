@@ -1,16 +1,13 @@
-//!
-//! Every type of page supports 3 operations:
-//! insert
-//! delete
-//! next
-//!
-
 use crate::buffer_pool::{BufferPool, DBReader, PAGE_SIZE, PageID, PageRef};
 use crate::representations::page::{HeaderElem, InnerNode, Leaf, PageType, SlottedPage};
 use crate::representations::tuple::{Tuple, TupleBuf};
 use std::sync::Arc;
 
-/// ScanIterator returns tuples
+/// ScanIterator iterates over tuples of a page. 
+/// 
+/// After initialization with a starting page and the current slot idx being looked at,
+/// the iterator will use sibling pointers to traverse rightward grabbing new pages. 
+/// As it goes it checks if the end key has been reached. If not, it returns that iterator.
 #[derive(Debug)]
 struct ScanIterator<'a, R: DBReader> {
     pool: Arc<BufferPool<R>>,
@@ -62,6 +59,20 @@ impl<'a, R: DBReader> std::iter::Iterator for ScanIterator<'a, R> {
     }
 }
 
+/// A B-tree index over a [`BufferPool`].
+///
+/// `BTree` manages page-level storage for ordered key-value data. Pages are
+/// divided into two types: inner nodes that route lookups and leaf nodes that
+/// store [`Tuple`] data. Leaf nodes are linked via right-sibling pointers,
+/// enabling efficient range scans without ascending back to the root.
+///
+/// Insertions are handled recursively: when a page is full it is split and a
+/// separator key is promoted to the parent, which may itself require splitting
+/// up to the root.
+///
+/// # Type Parameters
+///
+/// * `R` - A [`DBReader`] that backs the [`BufferPool`] with persistent storage.
 #[derive(Debug)]
 struct BTree<R: DBReader> {
     pool: Arc<BufferPool<R>>,
