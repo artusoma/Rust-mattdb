@@ -209,9 +209,24 @@ impl<R: DBReader> BTree<R> {
         self.insert_recurs(leaf, tuple, parents);
     }
 
-    /// Get the leaf node of the tree containing the given key
-    fn get_leaf<'a>(
-        &'a self,
+    /// Traverses the tree from `page` downward, following child pointers in inner
+    /// nodes until a leaf is found whose range covers `key`.
+    ///
+    /// Returns the leaf [`PageRef`] together with the ordered stack of [`PageID`]s
+    /// for every inner node visited along the way (nearest ancestor last), which
+    /// callers use when propagating splits upward.
+    ///
+    /// # Potential improvements
+    ///
+    /// * **Replace recursion with a loop** — each recursive call only tail-calls
+    ///   itself, so the entire function body can be rewritten as a `loop { ... }`
+    ///   with no stack growth.
+    /// * **Single lock per node** — the current implementation acquires the read
+    ///   lock twice per inner node: once to read the page type and again to read
+    ///   the child pointer. Both values can be extracted inside a single lock scope
+    ///   to halve the locking overhead.
+    fn get_leaf(
+        &self,
         page: PageRef<R>,
         key: &[u8],
         mut parents: Vec<PageID>,
@@ -221,22 +236,23 @@ impl<R: DBReader> BTree<R> {
             PageType::new(SlottedPage::from_bytes(&lock).get_header(HeaderElem::PageType)).unwrap()
         };
         match page_type {
-            PageType::Leaf => (page, parents),
+            PageType::Leaf => {
+                // If we found the leaf, just return the page and the current parent stack
+                (page, parents)
+            }
             PageType::Node => {
-                let (next_id, this_id) = {
+                // Get the child id
+                let child_id = {
                     let lock = page.read().unwrap();
-                    let repr = SlottedPage::from_bytes(&lock);
-                    (
-                        repr.get_header(HeaderElem::RightSiblingPtr),
-                        repr.get_header(HeaderElem::PageID),
-                    )
+                    let repr = InnerNode::from_bytes(&lock);
+                    repr.child(key)
                 };
-                parents.push(this_id.into());
-                self.get_leaf(
-                    self.pool.get_page_ref(next_id.into()).unwrap(),
-                    key,
-                    parents,
-                )
+
+                // Push this onto the parents stack
+                parents.push(page.id());
+
+                // Recrusively call
+                self.get_leaf(self.pool.get_page_ref(child_id).unwrap(), key, parents)
             }
         }
     }
