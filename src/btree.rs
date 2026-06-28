@@ -1,5 +1,7 @@
 use crate::buffer_pool::{BufferPool, DBReader, PageID, PageRef};
-use crate::representations::page::{self, HeaderElem, InnerNode, Leaf, PageReadWriteError, PageType, SlottedPage};
+use crate::representations::page::{
+    HeaderElem, InnerNode, Leaf, PageReadWriteError, PageType, SlottedPage, NULL_PTR
+};
 use crate::representations::tuple::{Tuple, TupleBuf};
 use std::sync::Arc;
 
@@ -32,11 +34,17 @@ impl<'a, R: DBReader> std::iter::Iterator for ScanIterator<'a, R> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Get read lock for page to check the header
-        let lock = self.page.read().unwrap();
-        let leaf = Leaf::from_bytes(&lock);
-        let item_count = leaf.get_header(&HeaderElem::ItemCount) as usize;
-        let ptr = leaf.get_header(&HeaderElem::RightSiblingPtr);
-        drop(lock);
+        let (ptr, item_count) = {
+            let lock = self.page.read().unwrap();
+            let leaf = Leaf::from_bytes(&lock);
+            let item_count = leaf.get_header(&HeaderElem::ItemCount) as usize;
+            let ptr = leaf.get_header(&HeaderElem::RightSiblingPtr);
+            (ptr, item_count)
+        };
+
+        if ptr == NULL_PTR {
+            return None;
+        }
 
         // If we are at end of leaf, grab next page and reset idx
         if self.idx >= item_count {
@@ -102,65 +110,64 @@ impl<R: DBReader> BTree<R> {
     ///
     /// The `page` argument may be a leaf node or a inner node
     fn insert_recurs(&self, page: PageRef<R>, tuple: &Tuple, mut parents: Vec<PageID>) {
-        // Grab initially needed information
-        let page_type = {
-            let read_lock = page.read().unwrap();
-            let page_repr = SlottedPage::from_bytes(&read_lock);
-            let page_type = PageType::new(page_repr.get_header(&HeaderElem::PageType)).unwrap();
-            page_type
-        };
-
+        // Try an insert and store the result
         let insert_result = {
             let mut write_lock = page.write().unwrap();
             let page_repr = SlottedPage::from_bytes_mut(&mut write_lock);
             page_repr.insert(tuple)
         };
 
+        // Check the result. If it is Ok, then we inserted!
+        // If not, we need to get the parent and insert there.
         match insert_result {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(PageReadWriteError::OutOfSpace) => {
-                
-                let (sibling_id, sibling_ptr) = self.split_page(&page, page_type);
+                // Split the page, getting the new sibling id and ptr back
+                let (sibling_id, sibling_ptr) = self.split_page(&page);
+
+                // Get the parent, inserting up into it
                 let parent_id = self.get_parent(&page, &mut parents);
                 let parent = self.pool.get_page_ref(parent_id).unwrap();
                 self.insert_recurs(parent, &sibling_ptr, parents);
 
+                // Check if we are to insert into the left vs right parent
                 let to_insert = if tuple.key() < sibling_ptr.key() {
                     page
                 } else {
                     self.pool.get_page_ref(sibling_id).unwrap()
                 };
 
-                // There is room - we can insert into the leaf
+                // There is room - we can insert into the leaf.
+                // This unwrap is questionable. What if the tuple is huge?
+                // Especially after we already insert into parents
                 SlottedPage::from_bytes_mut(&mut to_insert.write().unwrap())
                     .insert(tuple)
                     .unwrap();
-                }
-            _ => {panic!()}
+            }
+            // Should not get anything else
+            Err(e) => unreachable!("unexpected insert error: {e:?}"),
         }
-        
     }
 
-    fn get_parent(&self, page: &PageRef<R>, parents: &mut Vec<u32>) -> u32 {
-        let parent_id = match parents.pop() {
+    fn get_parent(&self, page: &PageRef<R>, parents: &mut Vec<PageID>) -> PageID {
+        match parents.pop() {
             Some(parent_id) => parent_id,
             None => {
-                // Create new root. The left child ptr will be the current page id; sibling pointers are empty (0)
+                // Create new root. The left child ptr will be the current page id; sibling pointers are empty (NULL_PTR)
                 let new_id = self.pool.new_page();
                 let new_page = self.pool.get_page_ref(new_id).unwrap();
                 InnerNode::from_bytes_mut(&mut new_page.write().unwrap()).init(
                     new_id,
-                    0,
-                    0,
+                    NULL_PTR,
+                    NULL_PTR,
                     page.id(),
                 );
                 new_id
             }
-        };
-        parent_id
+        }
     }
 
-    fn split_page(&self, page: &PageRef<R>, page_type: PageType) -> (PageID, TupleBuf) {
+    fn split_page(&self, page: &PageRef<R>) -> (PageID, TupleBuf) {
         // Split page, updating sibling pointers
         let new_sibling_id = self.pool.new_page();
         let new_sibling_page = self.pool.get_page_ref(new_sibling_id).unwrap();
@@ -170,19 +177,27 @@ impl<R: DBReader> BTree<R> {
         {
             let read_lock = page.read().unwrap();
             let page_repr = SlottedPage::from_bytes(&read_lock);
-            match page_type {
+            // fix left child ptr here...
+            todo!(); 
+            match page_repr
+                .get_header(&HeaderElem::PageType)
+                .try_into()
+                .unwrap()
+            {
                 PageType::Leaf => Leaf::from_bytes_mut(&mut new_sibling_page.write().unwrap())
                     .init(
                         new_sibling_id,
                         page.id(),
                         page_repr.get_header(&HeaderElem::RightSiblingPtr),
                     ),
-                    PageType::Node => InnerNode::from_bytes_mut(&mut new_sibling_page.write().unwrap())
+
+                
+                PageType::Node => InnerNode::from_bytes_mut(&mut new_sibling_page.write().unwrap())
                     .init(
                         new_sibling_id,
                         page.id(),
                         page_repr.get_header(&HeaderElem::RightSiblingPtr),
-                        0,
+                        NULL_PTR,
                     ),
             };
         }

@@ -3,6 +3,9 @@ use std::ops::{Deref, DerefMut};
 use super::tuple::*;
 use crate::buffer_pool::{PAGE_SIZE, PageID};
 
+
+pub const NULL_PTR: PageID = PageID::MAX;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PageReadWriteError {
     #[error("Page is out of space for insert")]
@@ -138,7 +141,7 @@ impl SlottedPage {
         page_type: PageType,
         left_ptr: PageID,
         right_ptr: PageID,
-        left_child_ptr: Option<PageID>,
+        left_child_ptr: PageID,
     ) {
         self.set_header(&HeaderElem::PageID, page_id.try_into().unwrap());
         self.set_header(&HeaderElem::PageType, page_type.id().try_into().unwrap());
@@ -155,9 +158,7 @@ impl SlottedPage {
         self.set_header(&HeaderElem::RightSiblingPtr, right_ptr.try_into().unwrap());
         self.set_header(&HeaderElem::FreeSpacePtr, PAGE_SIZE.try_into().unwrap());
 
-        if let Some(x) = left_child_ptr {
-            self.set_header(&HeaderElem::LeftChildPtr, x.try_into().unwrap())
-        };
+        self.set_header(&HeaderElem::LeftChildPtr, left_child_ptr.try_into().unwrap())
     }
 
     pub fn tuple(&self, idx: usize) -> Option<&Tuple> {
@@ -382,7 +383,7 @@ impl SlottedPage {
             self.get_header(&HeaderElem::PageType).try_into().unwrap(), // unwrap; cannot fail
             self.get_header(&HeaderElem::LeftSiblingPtr),
             self.get_header(&HeaderElem::RightSiblingPtr),
-            Some(self.get_header(&HeaderElem::LeftChildPtr)),
+            self.get_header(&HeaderElem::LeftChildPtr),
         );
         for idx in 0..split_idx {
             temp.insert(self.tuple(idx).unwrap()).unwrap();
@@ -414,7 +415,7 @@ impl Leaf {
 
     pub fn init(&mut self, page_id: PageID, left_ptr: PageID, right_ptr: PageID) {
         self.0
-            .init(page_id, PageType::Leaf, left_ptr, right_ptr, None);
+            .init(page_id, PageType::Leaf, left_ptr, right_ptr, NULL_PTR);
     }
 }
 
@@ -468,7 +469,7 @@ impl InnerNode {
             PageType::Node,
             left_ptr,
             right_ptr,
-            Some(left_child_ptr),
+            left_child_ptr,
         );
     }
 
