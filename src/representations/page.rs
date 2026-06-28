@@ -168,27 +168,24 @@ impl SlottedPage {
         }
     }
 
-    fn find_key_inner(&self, key: &[u8], low: usize, high: usize) -> Option<usize> {
-        let idx = low + (high - low) / 2;
+    fn find_key_inner(&self, key: &[u8], mut low: usize, mut high: usize) -> Option<usize> {
+        loop {
+            let idx = low + (high - low) / 2;
 
-        if high == low {
-            return if key == self.tuple(high).unwrap().key() {
-                Some(high)
-            } else {
-                None
-            };
-        }
+            let this_key = self.tuple(idx).unwrap().key();
 
-        let this_key = self.tuple(idx).unwrap().key();
+            if high == low {
+                return if this_key == key { Some(high) } else { None };
+            }
 
-        match this_key.cmp(key) {
-            std::cmp::Ordering::Equal => Some(idx),
-            std::cmp::Ordering::Less => self.find_key_inner(key, idx + 1, high),
-            std::cmp::Ordering::Greater => {
-                if idx == 0 {
-                    return None;
-                } else {
-                    self.find_key_inner(key, low, idx - 1)
+            match this_key.cmp(key) {
+                std::cmp::Ordering::Equal => return Some(idx),
+                std::cmp::Ordering::Less => low = idx + 1,
+                std::cmp::Ordering::Greater => {
+                    if idx == 0 {
+                        return None;
+                    }
+                    high = idx - 1;
                 }
             }
         }
@@ -203,26 +200,41 @@ impl SlottedPage {
         }
     }
 
-    fn find_partition_inner(&self, key: &[u8], low: usize, high: usize) -> usize {
-        let idx = low + (high - low) / 2;
+    /// Returns the index at which `key` should be inserted to keep the slot array sorted,
+    /// searching within the inclusive index range `[low, high]`.
+    ///
+    /// For a page containing keys `[3, 5, 5, 7]`:
+    /// - `key = 2` → `0` (insert before everything)
+    /// - `key = 5` → `3` (insert after the last `5`, preserving append order for duplicates)
+    /// - `key = 9` → `4` (insert after everything)
+    ///
+    /// The implementation is an iterative binary search. Each branch narrows the window:
+    /// - `Less`: raise `low` past the midpoint — `key` belongs to the right.
+    /// - `Equal`: lower `high` to the midpoint — scan left to find the first match,
+    ///   so the returned index lands after all equal keys.
+    /// - `Greater`: lower `high` below the midpoint — `key` belongs to the left.
+    ///   Returns `0` immediately when `idx == 0` to avoid underflow.
+    fn find_partition_inner(&self, key: &[u8], mut low: usize, mut high: usize) -> usize {
+        loop {
+            let idx = low + (high - low) / 2;
 
-        let this_key = self.tuple(idx).unwrap().key();
-        if high == low {
-            match this_key.cmp(key) {
-                std::cmp::Ordering::Less => idx + 1,
-                std::cmp::Ordering::Equal => idx + 1,
-                _ => idx,
+            let this_key = self.tuple(idx).unwrap().key();
+            if high == low {
+                return match this_key.cmp(key) {
+                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => idx + 1,
+                    _ => idx,
+                };
             }
-        } else {
             match this_key.cmp(key) {
-                std::cmp::Ordering::Equal => self.find_partition_inner(key, low, idx),
-                std::cmp::Ordering::Less => self.find_partition_inner(key, idx + 1, high),
+                std::cmp::Ordering::Equal => {
+                    high = idx;
+                }
+                std::cmp::Ordering::Less => low = idx + 1,
                 std::cmp::Ordering::Greater => {
                     if idx == 0 {
-                        0
-                    } else {
-                        self.find_partition_inner(key, low, idx - 1)
+                        return 0;
                     }
+                    high = idx - 1;
                 }
             }
         }
@@ -283,7 +295,7 @@ impl SlottedPage {
         self.update_header(&HeaderElem::ContFreeSpace, -insert_size - 2);
         self.update_header(&HeaderElem::TotalFreeSpace, -insert_size - 2);
     }
- 
+
     /// Inserts a slot pointer at position `idx` in the slot array, shifting all
     /// slots at `idx..item_count` one position to the right to make room.
     ///
