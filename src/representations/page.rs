@@ -269,7 +269,7 @@ impl SlottedPage {
         // Write first
         // let mut_content = self.content_mut();
         self.0[tuple_write_ptr..tuple_write_ptr + data.len()].copy_from_slice(&data.0);
-        self.write_slot_at(slot_write_idx, tuple_write_ptr.try_into().unwrap());
+        self.insert_slot_at(slot_write_idx, tuple_write_ptr.try_into().unwrap());
 
         // Update header
         self.update_header_insert(data.size().into());
@@ -278,21 +278,33 @@ impl SlottedPage {
     }
 
     fn update_header_insert(&mut self, insert_size: i64) {
-        use HeaderElem::*;
-        self.update_header(&FreeSpacePtr, -insert_size);
-        self.update_header(&ItemCount, 1);
-        self.update_header(&ContFreeSpace, -insert_size - 2);
-        self.update_header(&TotalFreeSpace, -insert_size - 2);
+        self.update_header(&HeaderElem::FreeSpacePtr, -insert_size);
+        self.update_header(&HeaderElem::ItemCount, 1);
+        self.update_header(&HeaderElem::ContFreeSpace, -insert_size - 2);
+        self.update_header(&HeaderElem::TotalFreeSpace, -insert_size - 2);
     }
-
-    fn write_slot_at(&mut self, idx: usize, ptr: u16) {
-        // Move everything over
+ 
+    /// Inserts a slot pointer at position `idx` in the slot array, shifting all
+    /// slots at `idx..item_count` one position to the right to make room.
+    ///
+    /// The slot array grows toward higher byte offsets (away from the header),
+    /// while tuple data grows downward from [`HeaderElem::FreeSpacePtr`]. It is
+    /// the caller's responsibility to ensure that inserting this slot — which
+    /// consumes 2 bytes — will not cause the slot array to collide with the
+    /// tuple data region. [`Self::check_space`] enforces this precondition
+    /// before calling this function.
+    fn insert_slot_at(&mut self, idx: usize, ptr: u16) {
+        // Get pointer to where the slot should go
         let item_count = self.get_header(&HeaderElem::ItemCount) as usize;
         let start_ptr = HEADER_SIZE + idx * 2;
-        if item_count > 0 {
+
+        // check if we have items to move over
+        if idx < item_count {
             let end_ptr = HEADER_SIZE + (item_count - 1) * 2;
             self.0.copy_within(start_ptr..end_ptr + 2, start_ptr + 2);
         }
+
+        // Write new slot
         self.0[start_ptr..start_ptr + 2].copy_from_slice(&ptr.to_be_bytes());
     }
 
