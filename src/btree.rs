@@ -106,7 +106,7 @@ impl<R: DBReader> BTree<R> {
         let (page_space, page_type) = {
             let read_lock = page.read().unwrap();
             let page_repr = SlottedPage::from_bytes(&read_lock);
-            let page_space = page_repr.get_header(HeaderElem::FreeSpace);
+            let page_space = page_repr.get_header(HeaderElem::ContFreeSpace);
             let page_type = PageType::new(page_repr.get_header(HeaderElem::PageType)).unwrap();
             (page_space, page_type)
         };
@@ -119,15 +119,23 @@ impl<R: DBReader> BTree<R> {
         // (1) Split the page
         // (2) Insert a new key into the parent
         // (3) Possibly recurse that
-        if required_space > page_space {
-            let sibling_ptr = self.split_page(&page, page_type);
+        let to_insert = if required_space > page_space {
+            let (sibling_id, sibling_ptr) = self.split_page(&page, page_type);
             let parent_id = self.get_parent(&page, &mut parents);
             let parent = self.pool.get_page_ref(parent_id).unwrap();
             self.insert_recurs(parent, &sibling_ptr, parents);
-        }
+
+            if tuple.key() < sibling_ptr.key() {
+                page
+            } else {
+                self.pool.get_page_ref(sibling_id).unwrap()
+            }
+        } else {
+            page
+        };
 
         // There is room - we can insert into the leaf
-        Leaf::from_bytes_mut(&mut page.write().unwrap())
+        SlottedPage::from_bytes_mut(&mut to_insert.write().unwrap())
             .insert(tuple)
             .unwrap();
     }
@@ -151,7 +159,7 @@ impl<R: DBReader> BTree<R> {
         parent_id
     }
 
-    fn split_page(&self, page: &PageRef<R>, page_type: PageType) -> TupleBuf {
+    fn split_page(&self, page: &PageRef<R>, page_type: PageType) -> (PageID, TupleBuf) {
         // Split page, updating sibling pointers
         let new_sibling_id = self.pool.new_page();
         let new_sibling_page = self.pool.get_page_ref(new_sibling_id).unwrap();
@@ -194,7 +202,10 @@ impl<R: DBReader> BTree<R> {
         page_repr.set_header(HeaderElem::RightSiblingPtr, new_sibling_id);
 
         let sibling_key = new_page_repr.tuple(0).unwrap().key();
-        TupleBuf::new(sibling_key, &new_sibling_id.to_be_bytes())
+        (
+            new_sibling_id,
+            TupleBuf::new(sibling_key, &new_sibling_id.to_be_bytes()),
+        )
     }
 
     pub fn insert_tuple(&self, page_root: PageID, tuple: &Tuple) {
@@ -257,6 +268,12 @@ impl<R: DBReader> BTree<R> {
         }
     }
 
+    /// Delete a key from the B-Tree
+    ///
+    /// If this makes the page less than half full, then we need to check neighbors and maybe rearrange
+    /// if they have any we could steal.
+    ///
+    /// As a first step, I think we can just always merge with neighbor.
     pub fn delete(&self) {
         todo!()
     }

@@ -16,13 +16,14 @@ pub enum PageReadWriteError {
 pub enum HeaderElem {
     PageID,
     PageType,
-    FreeSpace,
+    ContFreeSpace,
     LastCommit,
     ItemCount,
     LeftSiblingPtr,
     RightSiblingPtr,
     FreeSpacePtr,
     LeftChildPtr,
+    TotalFreeSpace,
 }
 
 impl HeaderElem {
@@ -30,18 +31,19 @@ impl HeaderElem {
         match self {
             Self::PageID => 0,
             Self::PageType => 4,
-            Self::FreeSpace => 8,
+            Self::ContFreeSpace => 8,
             Self::LastCommit => 12,
             Self::ItemCount => 16,
             Self::LeftSiblingPtr => 20,
             Self::RightSiblingPtr => 24,
             Self::FreeSpacePtr => 28,
             Self::LeftChildPtr => 32,
+            Self::TotalFreeSpace => 36,
         }
     }
 }
 
-const HEADER_SIZE: usize = 4 * 9;
+const HEADER_SIZE: usize = 4 * 10;
 
 /// Page type in the BTree. Node pages map keys to page ids, leaf pages map keys to tuples
 #[derive(Debug, PartialEq)]
@@ -77,6 +79,13 @@ impl TryFrom<u32> for PageType {
     }
 }
 
+/// Represents space available on an insert
+enum SpaceStatus {
+    Ok,
+    NeedsCollapse,
+    OutOfSpace,
+}
+
 /// Single shared representation for a slotted page and its ensuing operations
 #[repr(transparent)]
 pub struct SlottedPage([u8]);
@@ -101,8 +110,8 @@ impl SlottedPage {
     }
 
     pub fn percent_full(&self) -> u8 {
-        100 - (self.get_header(HeaderElem::FreeSpace) as usize * 100 / (PAGE_SIZE - HEADER_SIZE))
-            as u8
+        100 - (self.get_header(HeaderElem::ContFreeSpace) as usize * 100
+            / (PAGE_SIZE - HEADER_SIZE)) as u8
     }
 
     pub fn init(
@@ -116,7 +125,7 @@ impl SlottedPage {
         self.set_header(HeaderElem::PageID, page_id.try_into().unwrap());
         self.set_header(HeaderElem::PageType, page_type.id().try_into().unwrap());
         self.set_header(
-            HeaderElem::FreeSpace,
+            HeaderElem::ContFreeSpace,
             (PAGE_SIZE - HEADER_SIZE).try_into().unwrap(),
         ); // 2 bytes for first slot
         self.set_header(HeaderElem::ItemCount, 0);
@@ -210,17 +219,41 @@ impl SlottedPage {
         }
     }
 
+    /// Determines whether the page has sufficient space for an insertion of `required` bytes.
+    ///
+    /// Distinguishes between two kinds of free space:
+    ///
+    /// - [`HeaderElem::ContFreeSpace`]: contiguous free space at the end of the data region.
+    ///   An insert can proceed immediately if this is large enough.
+    /// - [`HeaderElem::TotalFreeSpace`]: total free bytes including fragmented gaps left by
+    ///   previous deletions. If only this is sufficient, the page must be
+    ///   [collapsed](Self::collapse) first to compact the fragments into contiguous space.
+    ///
+    /// # Returns
+    ///
+    /// - [`SpaceStatus::Ok`] — enough contiguous space; insert can proceed directly.
+    /// - [`SpaceStatus::NeedsCollapse`] — enough total space but fragmented; compact first.
+    /// - [`SpaceStatus::OutOfSpace`] — not enough space even after compaction; page must be split.
+    fn check_space(&self, required: usize) -> SpaceStatus {
+        if self.get_header(HeaderElem::ContFreeSpace) as usize >= required {
+            SpaceStatus::Ok
+        } else if self.get_header(HeaderElem::TotalFreeSpace) as usize >= required {
+            SpaceStatus::NeedsCollapse
+        } else {
+            SpaceStatus::OutOfSpace
+        }
+    }
+
     pub fn insert(&mut self, data: &Tuple) -> Result<(), PageReadWriteError> {
-        // First, check free space
-        let free_space = self.get_header(HeaderElem::FreeSpace);
-        if (data.len() + 2usize) > free_space as usize {
-            return Err(PageReadWriteError::OutOfSpace);
+        // We need to check how much space we have.
+        match self.check_space(data.len() + 2usize) {
+            SpaceStatus::Ok => {}
+            SpaceStatus::NeedsCollapse => self.collapse(),
+            SpaceStatus::OutOfSpace => return Err(PageReadWriteError::OutOfSpace),
         }
 
         // Get slot write ptr and tuple write ptr
         let tuple_write_ptr = self.get_header(HeaderElem::FreeSpacePtr) as usize - data.len();
-
-        // Find slot write idx
         let slot_write_idx = self.find_partition(data.key());
 
         // I think the safest order is probably write out Tuple, then Slot, then update headers?
@@ -230,12 +263,24 @@ impl SlottedPage {
         self.write_slot_at(slot_write_idx, tuple_write_ptr.try_into().unwrap());
 
         // Update header
-        let item_count = self.get_header(HeaderElem::ItemCount);
-        self.set_header(HeaderElem::FreeSpace, free_space - data.len() as u32 - 2);
-        self.set_header(HeaderElem::FreeSpacePtr, tuple_write_ptr as u32);
-        self.set_header(HeaderElem::ItemCount, item_count + 1);
+        self.update_header_insert(data.size().into());
 
         Ok(())
+    }
+
+    fn update_header_insert(&mut self, insert_size: u32) {
+        self.set_header(
+            HeaderElem::TotalFreeSpace,
+            self.get_header(HeaderElem::TotalFreeSpace) - insert_size - 2,
+        );
+        self.set_header(
+            HeaderElem::ContFreeSpace,
+            self.get_header(HeaderElem::ContFreeSpace) - insert_size - 2,
+        );
+        self.set_header(
+            HeaderElem::ItemCount,
+            self.get_header(HeaderElem::ItemCount) + 1,
+        );
     }
 
     fn write_slot_at(&mut self, idx: usize, ptr: u16) {
@@ -280,6 +325,15 @@ impl SlottedPage {
             tuples.push(self.tuple(idx).unwrap().to_owned());
         }
 
+        // Only keep left side of the page
+        self.keep_left(split_idx);
+
+        // Return tuples
+        tuples
+    }
+
+    /// Cleans up the page, only keeping the first 0..split_idx items in the page
+    fn keep_left(&mut self, split_idx: usize) {
         // Create new temporary page to copy left into, then replace self.0
         let mut temp_bytes = [0u8; PAGE_SIZE];
         let temp = SlottedPage::from_bytes_mut(&mut temp_bytes);
@@ -294,9 +348,12 @@ impl SlottedPage {
             temp.insert(self.tuple(idx).unwrap()).unwrap();
         }
         self.0[0..PAGE_SIZE].copy_from_slice(&temp.0[0..PAGE_SIZE]);
+    }
 
-        // Return tuples
-        tuples
+    /// Collapse empty space in a page, so that [`HeaderElem::ContFreeSpace`]
+    /// and [`HeaderElem::TotalFreeSpace`] match.
+    pub fn collapse(&mut self) {
+        self.keep_left(self.get_header(HeaderElem::ItemCount) as usize);
     }
 }
 
@@ -352,8 +409,8 @@ impl InnerNode {
     }
 
     /// A wrapper of the base SlottedPage insert.
-    /// 
-    /// Creates a new tuple from a page_id that will be the new child. 
+    ///
+    /// Creates a new tuple from a page_id that will be the new child.
     pub fn insert(&mut self, key: &[u8], page_id: PageID) -> Result<(), PageReadWriteError> {
         let t = TupleBuf::new(key, &page_id.to_be_bytes());
         self.0.insert(&t)
