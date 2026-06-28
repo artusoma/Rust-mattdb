@@ -99,18 +99,23 @@ impl SlottedPage {
         unsafe { &mut *(bytes as *mut [u8] as *mut Self) }
     }
 
-    pub fn get_header(&self, element: HeaderElem) -> u32 {
+    pub fn get_header(&self, element: &HeaderElem) -> u32 {
         let offset = element.offset();
         u32::from_be_bytes(self.0[offset..offset + 4].try_into().unwrap())
     }
 
-    pub fn set_header(&mut self, element: HeaderElem, value: u32) {
+    pub fn set_header(&mut self, element: &HeaderElem, value: u32) {
         let offset = element.offset();
         self.0[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
     }
 
+    pub fn update_header(&mut self, element: &HeaderElem, diff: i64) {
+        let current = self.get_header(element);
+        self.set_header(element, ((current as i64) + diff) as u32);
+    }
+
     pub fn percent_full(&self) -> u8 {
-        100 - (self.get_header(HeaderElem::ContFreeSpace) as usize * 100
+        100 - (self.get_header(&HeaderElem::ContFreeSpace) as usize * 100
             / (PAGE_SIZE - HEADER_SIZE)) as u8
     }
 
@@ -122,25 +127,29 @@ impl SlottedPage {
         right_ptr: PageID,
         left_child_ptr: Option<PageID>,
     ) {
-        self.set_header(HeaderElem::PageID, page_id.try_into().unwrap());
-        self.set_header(HeaderElem::PageType, page_type.id().try_into().unwrap());
+        self.set_header(&HeaderElem::PageID, page_id.try_into().unwrap());
+        self.set_header(&HeaderElem::PageType, page_type.id().try_into().unwrap());
         self.set_header(
-            HeaderElem::ContFreeSpace,
+            &HeaderElem::ContFreeSpace,
             (PAGE_SIZE - HEADER_SIZE).try_into().unwrap(),
         ); // 2 bytes for first slot
-        self.set_header(HeaderElem::ItemCount, 0);
-        self.set_header(HeaderElem::LeftSiblingPtr, left_ptr.try_into().unwrap());
-        self.set_header(HeaderElem::RightSiblingPtr, right_ptr.try_into().unwrap());
-        self.set_header(HeaderElem::FreeSpacePtr, PAGE_SIZE.try_into().unwrap());
+        self.set_header(
+            &HeaderElem::TotalFreeSpace,
+            (PAGE_SIZE - HEADER_SIZE).try_into().unwrap(),
+        ); // 2 bytes for first slot
+        self.set_header(&HeaderElem::ItemCount, 0);
+        self.set_header(&HeaderElem::LeftSiblingPtr, left_ptr.try_into().unwrap());
+        self.set_header(&HeaderElem::RightSiblingPtr, right_ptr.try_into().unwrap());
+        self.set_header(&HeaderElem::FreeSpacePtr, PAGE_SIZE.try_into().unwrap());
 
         if let Some(x) = left_child_ptr {
-            self.set_header(HeaderElem::LeftChildPtr, x.try_into().unwrap())
+            self.set_header(&HeaderElem::LeftChildPtr, x.try_into().unwrap())
         };
     }
 
     pub fn tuple(&self, idx: usize) -> Option<&Tuple> {
         // Read first u16 / get size
-        let ptr = if self.get_header(HeaderElem::ItemCount) <= idx as u32 {
+        let ptr = if self.get_header(&HeaderElem::ItemCount) <= idx as u32 {
             None
         } else {
             let slot_ptr = HEADER_SIZE + idx * 2;
@@ -151,11 +160,11 @@ impl SlottedPage {
     }
 
     pub fn find_key(&self, key: &[u8]) -> Option<usize> {
-        let count = self.get_header(HeaderElem::ItemCount);
+        let count = self.get_header(&HeaderElem::ItemCount);
         if count == 0 {
             None
         } else {
-            self.find_key_inner(key, 0, self.get_header(HeaderElem::ItemCount) as usize - 1)
+            self.find_key_inner(key, 0, self.get_header(&HeaderElem::ItemCount) as usize - 1)
         }
     }
 
@@ -186,11 +195,11 @@ impl SlottedPage {
     }
 
     pub fn find_partition(&self, key: &[u8]) -> usize {
-        let count = self.get_header(HeaderElem::ItemCount);
+        let count = self.get_header(&HeaderElem::ItemCount);
         if count == 0 {
             0
         } else {
-            self.find_partition_inner(key, 0, self.get_header(HeaderElem::ItemCount) as usize - 1)
+            self.find_partition_inner(key, 0, self.get_header(&HeaderElem::ItemCount) as usize - 1)
         }
     }
 
@@ -235,9 +244,9 @@ impl SlottedPage {
     /// - [`SpaceStatus::NeedsCollapse`] — enough total space but fragmented; compact first.
     /// - [`SpaceStatus::OutOfSpace`] — not enough space even after compaction; page must be split.
     fn check_space(&self, required: usize) -> SpaceStatus {
-        if self.get_header(HeaderElem::ContFreeSpace) as usize >= required {
+        if self.get_header(&HeaderElem::ContFreeSpace) as usize >= required {
             SpaceStatus::Ok
-        } else if self.get_header(HeaderElem::TotalFreeSpace) as usize >= required {
+        } else if self.get_header(&HeaderElem::TotalFreeSpace) as usize >= required {
             SpaceStatus::NeedsCollapse
         } else {
             SpaceStatus::OutOfSpace
@@ -253,7 +262,7 @@ impl SlottedPage {
         }
 
         // Get slot write ptr and tuple write ptr
-        let tuple_write_ptr = self.get_header(HeaderElem::FreeSpacePtr) as usize - data.len();
+        let tuple_write_ptr = self.get_header(&HeaderElem::FreeSpacePtr) as usize - data.len();
         let slot_write_idx = self.find_partition(data.key());
 
         // I think the safest order is probably write out Tuple, then Slot, then update headers?
@@ -268,24 +277,17 @@ impl SlottedPage {
         Ok(())
     }
 
-    fn update_header_insert(&mut self, insert_size: u32) {
-        self.set_header(
-            HeaderElem::TotalFreeSpace,
-            self.get_header(HeaderElem::TotalFreeSpace) - insert_size - 2,
-        );
-        self.set_header(
-            HeaderElem::ContFreeSpace,
-            self.get_header(HeaderElem::ContFreeSpace) - insert_size - 2,
-        );
-        self.set_header(
-            HeaderElem::ItemCount,
-            self.get_header(HeaderElem::ItemCount) + 1,
-        );
+    fn update_header_insert(&mut self, insert_size: i64) {
+        use HeaderElem::*;
+        self.update_header(&FreeSpacePtr, -insert_size);
+        self.update_header(&ItemCount, 1);
+        self.update_header(&ContFreeSpace, -insert_size - 2);
+        self.update_header(&TotalFreeSpace, -insert_size - 2);
     }
 
     fn write_slot_at(&mut self, idx: usize, ptr: u16) {
         // Move everything over
-        let item_count = self.get_header(HeaderElem::ItemCount) as usize;
+        let item_count = self.get_header(&HeaderElem::ItemCount) as usize;
         let start_ptr = HEADER_SIZE + idx * 2;
         if item_count > 0 {
             let end_ptr = HEADER_SIZE + (item_count - 1) * 2;
@@ -300,8 +302,8 @@ impl SlottedPage {
             .ok_or(PageReadWriteError::KeyNotFound(format!("{:?}", key)))?;
 
         // Set new item count
-        let current_count = self.get_header(HeaderElem::ItemCount);
-        self.set_header(HeaderElem::ItemCount, current_count - 1);
+        let current_count = self.get_header(&HeaderElem::ItemCount);
+        self.set_header(&HeaderElem::ItemCount, current_count - 1);
 
         // Move everything over to cover now deleted key.
         // The `end_ptr` maps from current item count to copy end.
@@ -316,7 +318,7 @@ impl SlottedPage {
 
     pub fn split_half(&mut self) -> Vec<TupleBuf> {
         // Get how many items vs keep vs remove. Left is kept, right is moved.
-        let item_count = self.get_header(HeaderElem::ItemCount) as usize;
+        let item_count = self.get_header(&HeaderElem::ItemCount) as usize;
         let split_idx = item_count / 2;
 
         // Grab tuples that will go right
@@ -338,11 +340,11 @@ impl SlottedPage {
         let mut temp_bytes = [0u8; PAGE_SIZE];
         let temp = SlottedPage::from_bytes_mut(&mut temp_bytes);
         temp.init(
-            self.get_header(HeaderElem::PageID),
-            self.get_header(HeaderElem::PageType).try_into().unwrap(), // unwrap; cannot fail
-            self.get_header(HeaderElem::LeftSiblingPtr),
-            self.get_header(HeaderElem::RightSiblingPtr),
-            Some(self.get_header(HeaderElem::LeftChildPtr)),
+            self.get_header(&HeaderElem::PageID),
+            self.get_header(&HeaderElem::PageType).try_into().unwrap(), // unwrap; cannot fail
+            self.get_header(&HeaderElem::LeftSiblingPtr),
+            self.get_header(&HeaderElem::RightSiblingPtr),
+            Some(self.get_header(&HeaderElem::LeftChildPtr)),
         );
         for idx in 0..split_idx {
             temp.insert(self.tuple(idx).unwrap()).unwrap();
@@ -353,7 +355,7 @@ impl SlottedPage {
     /// Collapse empty space in a page, so that [`HeaderElem::ContFreeSpace`]
     /// and [`HeaderElem::TotalFreeSpace`] match.
     pub fn collapse(&mut self) {
-        self.keep_left(self.get_header(HeaderElem::ItemCount) as usize);
+        self.keep_left(self.get_header(&HeaderElem::ItemCount) as usize);
     }
 }
 
@@ -445,7 +447,7 @@ impl InnerNode {
     pub fn child(&self, key: &[u8]) -> PageID {
         let found_idx = self.0.find_partition(key);
         if found_idx == 0 {
-            self.0.get_header(HeaderElem::LeftChildPtr)
+            self.0.get_header(&HeaderElem::LeftChildPtr)
         } else {
             u32::from_be_bytes(
                 self.0
@@ -614,10 +616,10 @@ mod tests {
         let page = Leaf::from_bytes_mut(&mut bytes);
         page.init(1, 15, 66);
 
-        assert_eq!(1, page.get_header(HeaderElem::PageID));
+        assert_eq!(1, page.get_header(&HeaderElem::PageID));
         assert_eq!(
             PageType::Leaf,
-            PageType::new(page.get_header(HeaderElem::PageType)).unwrap()
+            PageType::new(page.get_header(&HeaderElem::PageType)).unwrap()
         );
     }
 
