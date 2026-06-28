@@ -91,6 +91,10 @@ enum SpaceStatus {
 pub struct SlottedPage([u8]);
 
 impl SlottedPage {
+    
+    /*
+    INIT OPERATIONS
+    */
     pub fn from_bytes(bytes: &[u8]) -> &Self {
         unsafe { &*(bytes as *const [u8] as *const Self) }
     }
@@ -98,6 +102,11 @@ impl SlottedPage {
     pub fn from_bytes_mut(bytes: &mut [u8]) -> &mut Self {
         unsafe { &mut *(bytes as *mut [u8] as *mut Self) }
     }
+
+
+    /*
+    HEADER OPERATIONS
+    */
 
     pub fn get_header(&self, element: &HeaderElem) -> u32 {
         let offset = element.offset();
@@ -118,6 +127,10 @@ impl SlottedPage {
         100 - (self.get_header(&HeaderElem::ContFreeSpace) as usize * 100
             / (PAGE_SIZE - HEADER_SIZE)) as u8
     }
+
+    /*
+    B-TREE OPERATIONS
+    */
 
     pub fn init(
         &mut self,
@@ -346,7 +359,7 @@ impl SlottedPage {
         let split_idx = item_count / 2;
 
         // Grab tuples that will go right
-        let mut tuples: Vec<TupleBuf> = Vec::with_capacity(item_count);
+        let mut tuples: Vec<TupleBuf> = Vec::with_capacity(item_count - split_idx);
         for idx in split_idx..item_count {
             tuples.push(self.tuple(idx).unwrap().to_owned());
         }
@@ -361,8 +374,9 @@ impl SlottedPage {
     /// Cleans up the page, only keeping the first 0..split_idx items in the page
     fn keep_left(&mut self, split_idx: usize) {
         // Create new temporary page to copy left into, then replace self.0
-        let mut temp_bytes = [0u8; PAGE_SIZE];
-        let temp = SlottedPage::from_bytes_mut(&mut temp_bytes);
+        // Use a box to avoid allocating 8kb on the stack...
+        let mut temp_bytes = Box::new([0u8; PAGE_SIZE]);
+        let temp = SlottedPage::from_bytes_mut(&mut *temp_bytes);
         temp.init(
             self.get_header(&HeaderElem::PageID),
             self.get_header(&HeaderElem::PageType).try_into().unwrap(), // unwrap; cannot fail
@@ -373,7 +387,7 @@ impl SlottedPage {
         for idx in 0..split_idx {
             temp.insert(self.tuple(idx).unwrap()).unwrap();
         }
-        self.0[0..PAGE_SIZE].copy_from_slice(&temp.0[0..PAGE_SIZE]);
+        self.0.copy_from_slice(&temp.0[0..PAGE_SIZE]);
     }
 
     /// Collapse empty space in a page, so that [`HeaderElem::ContFreeSpace`]
