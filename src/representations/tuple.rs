@@ -16,8 +16,16 @@ impl Key {
         u16::from_be_bytes(self.0[0..2].try_into().unwrap())
     }
 
-    pub fn key(&self) -> &[u8] {
+    pub fn bytes(&self) -> &[u8] {
         &self.0[2..self.0.len()]
+    }
+}
+
+impl ToOwned for Key {
+    type Owned = KeyBuf;
+
+    fn to_owned(&self) -> Self::Owned {
+        KeyBuf::new(&self.0)
     }
 }
 
@@ -39,6 +47,13 @@ impl Deref for KeyBuf {
     type Target = Key;
 
     fn deref(&self) -> &Self::Target {
+        Key::from_bytes(&self.bytes)
+    }
+}
+
+impl std::borrow::Borrow<Key> for KeyBuf {
+
+    fn borrow(&self) -> &Key {
         Key::from_bytes(&self.bytes)
     }
 }
@@ -65,9 +80,9 @@ impl Tuple {
         u16::from_be_bytes(self.0[2..4].try_into().unwrap())
     }
 
-    pub fn key(&self) -> &[u8] {
+    pub fn key(&self) -> &Key {
         let key_size = self.key_size();
-        &self.0[4..4 + key_size as usize]
+        Key::from_bytes(&self.0[2..2 + 2 + key_size as usize])
     }
 
     pub fn value(&self) -> &[u8] {
@@ -152,7 +167,7 @@ mod tests {
         let value = Serializer::serialize_single(&DataType::Int, &DataValue::Int(15)).unwrap();
         let tuple = TupleBuf::new(&key, &value);
         assert_eq!(tuple.size(), 12);
-        assert_eq!(tuple.key(), key);
+        assert_eq!(tuple.key().bytes(), key);
     }
 
     #[test]
@@ -164,6 +179,6 @@ mod tests {
         .unwrap();
         let k = KeyBuf::new(&key);
         assert_eq!(k.size(), 16);
-        assert_eq!(k.key(), key);
+        assert_eq!(k.bytes(), key);
     }
 }

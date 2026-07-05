@@ -1,6 +1,6 @@
 use crate::buffer_pool::{BufferPool, DBReader, PageID, PageRef};
 use crate::representations::page::{
-    HeaderElem, InnerNode, Leaf, PageReadWriteError, PageType, SlottedPage, NULL_PTR
+    HeaderElem, InnerNode, Leaf, NULL_PTR, PageReadWriteError, PageType, SlottedPage,
 };
 use crate::representations::tuple::{Tuple, TupleBuf};
 use std::sync::Arc;
@@ -59,7 +59,7 @@ impl<'a, R: DBReader> std::iter::Iterator for ScanIterator<'a, R> {
         // Get next pair. Check key to see if we are at end.
         let t = leaf.tuple(self.idx).unwrap();
         self.idx += 1;
-        if t.key() > self.end_key {
+        if t.key().bytes() > self.end_key {
             None
         } else {
             Some(t.value().to_vec())
@@ -109,6 +109,10 @@ impl<R: DBReader> BTree<R> {
     /// Recursively inserts data into the page.
     ///
     /// The `page` argument may be a leaf node or a inner node
+    ///
+    /// # To-do
+    /// \[ ] Check for a tuple overflow when we do a final insert after inserting into
+    ///     parent. Right now we unwrap, which may cause issues later.
     fn insert_recurs(&self, page: PageRef<R>, tuple: &Tuple, mut parents: Vec<PageID>) {
         // Try an insert and store the result
         let insert_result = {
@@ -122,27 +126,17 @@ impl<R: DBReader> BTree<R> {
         match insert_result {
             Ok(_) => {}
             Err(PageReadWriteError::OutOfSpace) => {
-                // Split the page, getting the new sibling id and ptr back
-                let (sibling_id, sibling_ptr) = self.split_page(&page);
+                // Do an insert and split, getting what we need to insert into parent
+                let upstream_key = self.split_and_insert(&page, &tuple);
 
-                // Get the parent, inserting up into it
+                // This parent will either be an existing node in the tree,
+                // or a new parent node returned will have a left pointer to the original
+                // page that we split.
                 let parent_id = self.get_parent(&page, &mut parents);
-                let parent = self.pool.get_page_ref(parent_id).unwrap();
-                self.insert_recurs(parent, &sibling_ptr, parents);
+                let parent_ref = self.pool.get_page_ref(parent_id).unwrap();
 
-                // Check if we are to insert into the left vs right parent
-                let to_insert = if tuple.key() < sibling_ptr.key() {
-                    page
-                } else {
-                    self.pool.get_page_ref(sibling_id).unwrap()
-                };
-
-                // There is room - we can insert into the leaf.
-                // This unwrap is questionable. What if the tuple is huge?
-                // Especially after we already insert into parents
-                SlottedPage::from_bytes_mut(&mut to_insert.write().unwrap())
-                    .insert(tuple)
-                    .unwrap();
+                // Now insert the sibling pointer into the parent that we got
+                self.insert_recurs(parent_ref, &upstream_key, parents);
             }
             // Should not get anything else
             Err(e) => unreachable!("unexpected insert error: {e:?}"),
@@ -167,68 +161,99 @@ impl<R: DBReader> BTree<R> {
         }
     }
 
-    fn split_page(&self, page: &PageRef<R>) -> (PageID, TupleBuf) {
+    /// Splits the page and inserts the tuple, returning the tuple that needs to be inserted
+    /// into the parent.
+    fn split_and_insert(&self, page: &PageRef<R>, tuple: &Tuple) -> TupleBuf {
         // Split page, updating sibling pointers
         let new_sibling_id = self.pool.new_page();
         let new_sibling_page = self.pool.get_page_ref(new_sibling_id).unwrap();
 
-        // Based on the current page type, we need to split a page with that same type.
-        // The left ptr will be the called page, and right ptr will be the called page's right ptr
-        {
-            let read_lock = page.read().unwrap();
-            let page_repr = SlottedPage::from_bytes(&read_lock);
-            // fix left child ptr here...
-            todo!(); 
-            match page_repr
-                .get_header(&HeaderElem::PageType)
-                .try_into()
-                .unwrap()
-            {
-                PageType::Leaf => Leaf::from_bytes_mut(&mut new_sibling_page.write().unwrap())
-                    .init(
-                        new_sibling_id,
-                        page.id(),
-                        page_repr.get_header(&HeaderElem::RightSiblingPtr),
-                    ),
-
-                
-                PageType::Node => InnerNode::from_bytes_mut(&mut new_sibling_page.write().unwrap())
-                    .init(
-                        new_sibling_id,
-                        page.id(),
-                        page_repr.get_header(&HeaderElem::RightSiblingPtr),
-                        NULL_PTR,
-                    ),
-            };
-        }
-
-        // Get page locks and representations for the left and right pages.
-        // Move tuples from right into left
+        // Get locks
         let mut write_lock = page.write().unwrap();
-        let page_repr = SlottedPage::from_bytes_mut(&mut write_lock);
-
         let mut new_write_lock = new_sibling_page.write().unwrap();
-        let new_page_repr = SlottedPage::from_bytes_mut(&mut new_write_lock);
 
-        for moved_tuple in page_repr.split_half().iter() {
-            new_page_repr.insert(&moved_tuple).unwrap();
+        // Check if we looking at a leaf or a node.
+        // If a leaf, we need to just split and keep everything.
+        // If a node, we need to take the middle key, then split
+        match SlottedPage::from_bytes_mut(&mut write_lock)
+            .get_header(&HeaderElem::PageType)
+            .try_into()
+            .unwrap()
+        {
+            PageType::Leaf => {
+                let left_page_repr = Leaf::from_bytes_mut(&mut write_lock);
+                let right_page_repr = Leaf::from_bytes_mut(&mut new_write_lock);
+
+                let (middle_tuple, right_tuples) = left_page_repr.split_half(tuple);
+
+                for moved_tuple in right_tuples.iter() {
+                    right_page_repr.insert(&moved_tuple).unwrap();
+                }
+
+                // Init sibling page
+                // The new left child ptr needs to be the page that the promoted
+                // middle key used to point to
+                right_page_repr.init(
+                    new_sibling_id,
+                    page.id(),
+                    left_page_repr.get_header(&HeaderElem::RightSiblingPtr),
+                );
+
+                match tuple.key().bytes().cmp(middle_tuple.key().bytes()) {
+                    std::cmp::Ordering::Less => left_page_repr.insert(tuple).unwrap(),
+                    _ => right_page_repr.insert(tuple).unwrap(),
+                }
+
+                left_page_repr.set_header(
+                    &HeaderElem::RightSiblingPtr,
+                    right_page_repr.get_header(&HeaderElem::PageID),
+                );
+
+                middle_tuple
+            }
+
+            PageType::Node => {
+                let left_page_repr = InnerNode::from_bytes_mut(&mut write_lock);
+                let right_page_repr = InnerNode::from_bytes_mut(&mut new_write_lock);
+
+                let (middle_tuple, right_tuples) = left_page_repr.split_half(tuple);
+
+                for moved_tuple in right_tuples.iter() {
+                    right_page_repr.insert(&moved_tuple).unwrap();
+                }
+
+                // Init sibling page
+                // The new left child ptr needs to be the page that the promoted
+                // middle key used to point to
+                right_page_repr.init(
+                    new_sibling_id,
+                    page.id(),
+                    left_page_repr.get_header(&HeaderElem::RightSiblingPtr),
+                    u32::from_be_bytes(middle_tuple.value().try_into().unwrap()),
+                );
+
+                match tuple.key().bytes().cmp(middle_tuple.key().bytes()) {
+                    // Insert into left
+                    std::cmp::Ordering::Less => left_page_repr.insert(tuple).unwrap(),
+                    std::cmp::Ordering::Equal => {}
+                    std::cmp::Ordering::Greater => right_page_repr.insert(tuple).unwrap(),
+                }
+
+                left_page_repr.set_header(
+                    &HeaderElem::RightSiblingPtr,
+                    right_page_repr.get_header(&HeaderElem::PageID),
+                );
+
+                middle_tuple
+            }
         }
-
-        // Update current page to point to new sibling on right
-        page_repr.set_header(&HeaderElem::RightSiblingPtr, new_sibling_id);
-
-        let sibling_key = new_page_repr.tuple(0).unwrap().key();
-        (
-            new_sibling_id,
-            TupleBuf::new(sibling_key, &new_sibling_id.to_be_bytes()),
-        )
     }
 
     pub fn insert_tuple(&self, page_root: PageID, tuple: &Tuple) {
         // Get leaf page if not leaf page
         let (leaf, parents) = self.get_leaf(
             self.pool.get_page_ref(page_root).unwrap(),
-            tuple.key(),
+            tuple.key().bytes(),
             Vec::new(),
         );
 

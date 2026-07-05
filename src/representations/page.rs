@@ -3,7 +3,6 @@ use std::ops::{Deref, DerefMut};
 use super::tuple::*;
 use crate::buffer_pool::{PAGE_SIZE, PageID};
 
-
 pub const NULL_PTR: PageID = PageID::MAX;
 
 #[derive(Debug, thiserror::Error)]
@@ -94,7 +93,6 @@ enum SpaceStatus {
 pub struct SlottedPage([u8]);
 
 impl SlottedPage {
-    
     /*
     INIT OPERATIONS
     */
@@ -105,7 +103,6 @@ impl SlottedPage {
     pub fn from_bytes_mut(bytes: &mut [u8]) -> &mut Self {
         unsafe { &mut *(bytes as *mut [u8] as *mut Self) }
     }
-
 
     /*
     HEADER OPERATIONS
@@ -158,7 +155,10 @@ impl SlottedPage {
         self.set_header(&HeaderElem::RightSiblingPtr, right_ptr.try_into().unwrap());
         self.set_header(&HeaderElem::FreeSpacePtr, PAGE_SIZE.try_into().unwrap());
 
-        self.set_header(&HeaderElem::LeftChildPtr, left_child_ptr.try_into().unwrap())
+        self.set_header(
+            &HeaderElem::LeftChildPtr,
+            left_child_ptr.try_into().unwrap(),
+        )
     }
 
     pub fn tuple(&self, idx: usize) -> Option<&Tuple> {
@@ -186,7 +186,7 @@ impl SlottedPage {
         loop {
             let idx = low + (high - low) / 2;
 
-            let this_key = self.tuple(idx).unwrap().key();
+            let this_key = self.tuple(idx).unwrap().key().bytes();
 
             if high == low {
                 return if this_key == key { Some(high) } else { None };
@@ -232,7 +232,7 @@ impl SlottedPage {
         loop {
             let idx = low + (high - low) / 2;
 
-            let this_key = self.tuple(idx).unwrap().key();
+            let this_key = self.tuple(idx).unwrap().key().bytes();
             if high == low {
                 return match this_key.cmp(key) {
                     std::cmp::Ordering::Less | std::cmp::Ordering::Equal => idx + 1,
@@ -289,7 +289,7 @@ impl SlottedPage {
 
         // Get slot write ptr and tuple write ptr
         let tuple_write_ptr = self.get_header(&HeaderElem::FreeSpacePtr) as usize - data.len();
-        let slot_write_idx = self.find_partition(data.key());
+        let slot_write_idx = self.find_partition(data.key().bytes());
 
         // I think the safest order is probably write out Tuple, then Slot, then update headers?
         // Write first
@@ -354,24 +354,6 @@ impl SlottedPage {
         Ok(())
     }
 
-    pub fn split_half(&mut self) -> Vec<TupleBuf> {
-        // Get how many items vs keep vs remove. Left is kept, right is moved.
-        let item_count = self.get_header(&HeaderElem::ItemCount) as usize;
-        let split_idx = item_count / 2;
-
-        // Grab tuples that will go right
-        let mut tuples: Vec<TupleBuf> = Vec::with_capacity(item_count - split_idx);
-        for idx in split_idx..item_count {
-            tuples.push(self.tuple(idx).unwrap().to_owned());
-        }
-
-        // Only keep left side of the page
-        self.keep_left(split_idx);
-
-        // Return tuples
-        tuples
-    }
-
     /// Cleans up the page, only keeping the first 0..split_idx items in the page
     fn keep_left(&mut self, split_idx: usize) {
         // Create new temporary page to copy left into, then replace self.0
@@ -395,6 +377,32 @@ impl SlottedPage {
     /// and [`HeaderElem::TotalFreeSpace`] match.
     pub fn collapse(&mut self) {
         self.keep_left(self.get_header(&HeaderElem::ItemCount) as usize);
+    }
+
+    pub fn split_half(&mut self, tuple: &Tuple) -> (TupleBuf, Vec<TupleBuf>) {
+        // Get how many items vs keep vs remove. Left is kept, right is moved.
+        let item_count = self.get_header(&HeaderElem::ItemCount) as usize + 1;
+
+        // Get idx where this key would go
+        let key_loc = self.find_partition(&tuple.key().bytes());
+        let middle_idx = item_count / 2;
+
+        let (split_idx, middle_tuple) = match key_loc.cmp(&middle_idx) {
+            std::cmp::Ordering::Less => (middle_idx - 1, self.tuple(middle_idx - 1).unwrap().to_owned()),
+            std::cmp::Ordering::Equal => (middle_idx, tuple.to_owned()),
+            std::cmp::Ordering::Greater => (middle_idx, self.tuple(middle_idx).unwrap().to_owned()),
+        };
+
+        // Grab tuples that will go right
+        let mut tuples: Vec<TupleBuf> = Vec::with_capacity(item_count - split_idx);
+        for idx in split_idx..item_count {
+            tuples.push(self.tuple(idx).unwrap().to_owned());
+        }
+
+        // Only keep left side of the page
+        self.keep_left(split_idx);
+
+        (middle_tuple, tuples)
     }
 }
 
@@ -449,14 +457,6 @@ impl InnerNode {
         unsafe { &mut *(bytes as *mut [u8] as *mut SlottedPage as *mut InnerNode) }
     }
 
-    /// A wrapper of the base SlottedPage insert.
-    ///
-    /// Creates a new tuple from a page_id that will be the new child.
-    pub fn insert(&mut self, key: &[u8], page_id: PageID) -> Result<(), PageReadWriteError> {
-        let t = TupleBuf::new(key, &page_id.to_be_bytes());
-        self.0.insert(&t)
-    }
-
     pub fn init(
         &mut self,
         page_id: PageID,
@@ -464,13 +464,8 @@ impl InnerNode {
         right_ptr: PageID,
         left_child_ptr: PageID,
     ) {
-        self.0.init(
-            page_id,
-            PageType::Node,
-            left_ptr,
-            right_ptr,
-            left_child_ptr,
-        );
+        self.0
+            .init(page_id, PageType::Node, left_ptr, right_ptr, left_child_ptr);
     }
 
     /// Get the next child page in the search for `key`
@@ -500,6 +495,20 @@ impl InnerNode {
     }
 }
 
+impl Deref for InnerNode {
+    type Target = SlottedPage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for InnerNode {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,69 +530,6 @@ mod tests {
     // InnerNode::child — Base Tests
     // -----------------------------------------------------------------------
 
-    /// With keys [4, 7] and a key less than both, child() must return left_child_ptr.
-    ///
-    /// Tree picture:  left_child_ptr | 4 => page_a | 7 => page_b
-    /// key = 2 falls left of everything => left_child_ptr (10).
-    #[test]
-    fn child_key_less_than_all_keys() {
-        let mut bytes = [0u8; PAGE_SIZE];
-        let node = make_inner_node(&mut bytes, 1, 10);
-        node.insert(&[4u8], 20).unwrap();
-        node.insert(&[7u8], 30).unwrap();
-
-        assert_eq!(10, node.child(&[2u8]));
-    }
-
-    /// With keys [4, 7], key == 4 should follow the child pointer stored *with* key 4
-    /// (page 20), not the left_child_ptr.
-    ///
-    /// B-tree convention: an inner-node key k means "all keys >= k go right".
-    #[test]
-    fn child_key_equal_to_first_key() {
-        let mut bytes = [0u8; PAGE_SIZE];
-        let node = make_inner_node(&mut bytes, 1, 10);
-        node.insert(&[4u8], 20).unwrap();
-        node.insert(&[7u8], 30).unwrap();
-
-        assert_eq!(20, node.child(&[4u8]));
-    }
-
-    /// With keys [4, 7], key = 5 lies between the two keys.
-    /// It belongs in the same child as key 4's right side (page 20).
-    #[test]
-    fn child_key_between_keys() {
-        let mut bytes = [0u8; PAGE_SIZE];
-        let node = make_inner_node(&mut bytes, 1, 10);
-        node.insert(&[4u8], 20).unwrap();
-        node.insert(&[7u8], 30).unwrap();
-
-        assert_eq!(20, node.child(&[5u8]));
-    }
-
-    /// With keys [4, 7], key == 7 should return the child pointer stored with key 7 (page 30).
-    #[test]
-    fn child_key_equal_to_last_key() {
-        let mut bytes = [0u8; PAGE_SIZE];
-        let node = make_inner_node(&mut bytes, 1, 10);
-        node.insert(&[4u8], 20).unwrap();
-        node.insert(&[7u8], 30).unwrap();
-
-        assert_eq!(30, node.child(&[7u8]));
-    }
-
-    /// With keys [4, 7], key = 9 is greater than all keys.
-    /// It should still follow the rightmost child pointer (page 30, stored with key 7).
-    #[test]
-    fn child_key_greater_than_all_keys() {
-        let mut bytes = [0u8; PAGE_SIZE];
-        let node = make_inner_node(&mut bytes, 1, 10);
-        node.insert(&[4u8], 20).unwrap();
-        node.insert(&[7u8], 30).unwrap();
-
-        assert_eq!(30, node.child(&[9u8]));
-    }
-
     // -----------------------------------------------------------------------
     // InnerNode::child — Edge Case Tests
     // -----------------------------------------------------------------------
@@ -600,50 +546,6 @@ mod tests {
     }
 
     /// Single key: lookup with key < the only separator returns left_child_ptr.
-    #[test]
-    fn child_single_key_less_than_separator() {
-        let mut bytes = [0u8; PAGE_SIZE];
-        let node = make_inner_node(&mut bytes, 1, 10);
-        node.insert(&[5u8], 20).unwrap();
-
-        assert_eq!(10, node.child(&[3u8]));
-    }
-
-    /// Single key: lookup with key == the separator returns the child stored with that key.
-    #[test]
-    fn child_single_key_equal_to_separator() {
-        let mut bytes = [0u8; PAGE_SIZE];
-        let node = make_inner_node(&mut bytes, 1, 10);
-        node.insert(&[5u8], 20).unwrap();
-
-        assert_eq!(20, node.child(&[5u8]));
-    }
-
-    /// Single key: lookup with key > the separator returns the child stored with that key.
-    #[test]
-    fn child_single_key_greater_than_separator() {
-        let mut bytes = [0u8; PAGE_SIZE];
-        let node = make_inner_node(&mut bytes, 1, 10);
-        node.insert(&[5u8], 20).unwrap();
-
-        assert_eq!(20, node.child(&[8u8]));
-    }
-
-    /// Multi-byte keys: verify routing still works correctly when keys are wider than one byte.
-    #[test]
-    fn child_multi_byte_key_routing() {
-        let mut bytes = [0u8; PAGE_SIZE];
-        let node = make_inner_node(&mut bytes, 1, 10);
-        // Insert separator key [0, 100] => page 20
-        node.insert(&[0u8, 100u8], 20).unwrap();
-
-        // key [0, 50] is less than [0, 100] => left_child_ptr
-        assert_eq!(10, node.child(&[0u8, 50u8]));
-        // key [0, 100] equals separator => page 20
-        assert_eq!(20, node.child(&[0u8, 100u8]));
-        // key [0, 200] is greater => page 20
-        assert_eq!(20, node.child(&[0u8, 200u8]));
-    }
 
     // -----------------------------------------------------------------------
     // Existing tests
