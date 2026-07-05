@@ -96,7 +96,7 @@ impl<R: DBReader> BTree<R> {
         end: &'a [u8],
     ) -> ScanIterator<'a, R> {
         let page = self.pool.get_page_ref(page_root).unwrap();
-        let (leaf, _) = self.get_leaf(page, start, Vec::new());
+        let (leaf, _) = self.traverse_to_leaf(page, start, Vec::new());
 
         // Get start index of search in page
         let start_idx = {
@@ -109,10 +109,6 @@ impl<R: DBReader> BTree<R> {
     /// Recursively inserts data into the page.
     ///
     /// The `page` argument may be a leaf node or a inner node
-    ///
-    /// # To-do
-    /// \[ ] Check for a tuple overflow when we do a final insert after inserting into
-    ///     parent. Right now we unwrap, which may cause issues later.
     fn insert_recurs(&self, page: PageRef<R>, tuple: &Tuple, mut parents: Vec<PageID>) {
         // Try an insert and store the result
         let insert_result = {
@@ -251,7 +247,7 @@ impl<R: DBReader> BTree<R> {
 
     pub fn insert_tuple(&self, page_root: PageID, tuple: &Tuple) {
         // Get leaf page if not leaf page
-        let (leaf, parents) = self.get_leaf(
+        let (leaf, parents) = self.traverse_to_leaf(
             self.pool.get_page_ref(page_root).unwrap(),
             tuple.key().bytes(),
             Vec::new(),
@@ -277,7 +273,7 @@ impl<R: DBReader> BTree<R> {
     ///   lock twice per inner node: once to read the page type and again to read
     ///   the child pointer. Both values can be extracted inside a single lock scope
     ///   to halve the locking overhead.
-    fn get_leaf(
+    fn traverse_to_leaf(
         &self,
         page: PageRef<R>,
         key: &[u8],
@@ -304,7 +300,7 @@ impl<R: DBReader> BTree<R> {
                 parents.push(page.id());
 
                 // Recrusively call
-                self.get_leaf(self.pool.get_page_ref(child_id).unwrap(), key, parents)
+                self.traverse_to_leaf(self.pool.get_page_ref(child_id).unwrap(), key, parents)
             }
         }
     }

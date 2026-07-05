@@ -116,6 +116,7 @@ impl ToOwned for Tuple {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub struct TupleBuf {
     bytes: Vec<u8>,
 }

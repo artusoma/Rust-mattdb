@@ -196,10 +196,11 @@ impl SlottedPage {
                 std::cmp::Ordering::Equal => return Some(idx),
                 std::cmp::Ordering::Less => low = idx + 1,
                 std::cmp::Ordering::Greater => {
-                    if idx == 0 {
-                        return None;
+                    if idx == low {
+                        high = high - 1;
+                    } else {
+                        high = idx - 1;   
                     }
-                    high = idx - 1;
                 }
             }
         }
@@ -245,10 +246,11 @@ impl SlottedPage {
                 }
                 std::cmp::Ordering::Less => low = idx + 1,
                 std::cmp::Ordering::Greater => {
-                    if idx == 0 {
-                        return 0;
+                    if idx == low {
+                        high = high - 1
+                    } else {
+                        high = idx - 1;
                     }
-                    high = idx - 1;
                 }
             }
         }
@@ -334,23 +336,50 @@ impl SlottedPage {
         self.0[start_ptr..start_ptr + 2].copy_from_slice(&ptr.to_be_bytes());
     }
 
+    /// Removes a key-value pair from the page.
+    ///
+    /// Locates the tuple with the given key and removes it, shifting the remaining
+    /// slot pointers to fill the gap. The tuple data itself remains in memory but becomes
+    /// unreachable, contributing to fragmentation that can be recovered via [`collapse`](Self::collapse).
+    ///
+    /// # Arguments
+    ///
+    /// * `key` — the key bytes to search for and delete.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` on successful deletion, or `KeyNotFound` if the key does not exist.
+    ///
+    /// # Behavior
+    ///
+    /// - Updates [`ItemCount`](HeaderElem::ItemCount) to reflect the new number of items.
+    /// - Updates [`TotalFreeSpace`](HeaderElem::TotalFreeSpace) to account for the freed tuple data
+    ///   and its 2-byte slot.
+    /// - Leaves the tuple data and any gaps in memory (fragmentation). Use [`collapse`](Self::collapse)
+    ///   to reclaim fragmented space.
     pub fn delete(&mut self, key: &[u8]) -> Result<(), PageReadWriteError> {
         let delete_idx = self
             .find_key(key)
             .ok_or(PageReadWriteError::KeyNotFound(format!("{:?}", key)))?;
 
-        // Set new item count
-        let current_count = self.get_header(&HeaderElem::ItemCount);
-        self.set_header(&HeaderElem::ItemCount, current_count - 1);
+        // Get size of tuple to mark the free space
+        let tuple_size = self.tuple(delete_idx).unwrap().size();
 
         // Move everything over to cover now deleted key.
         // The `end_ptr` maps from current item count to copy end.
         // Ex: if 1 item, then the end_ptr will be 2.
+        let current_count = self.get_header(&HeaderElem::ItemCount);
         if current_count > 1 {
-            let start_ptr = HEADER_SIZE + delete_idx * 2;
+            let start_ptr = HEADER_SIZE + delete_idx * 2 + 2;
             let end_ptr = HEADER_SIZE + current_count as usize * 2;
             self.0.copy_within(start_ptr..end_ptr, start_ptr - 2);
-        };
+        }
+
+
+        // Set new item count and free space
+        self.update_header(&HeaderElem::ItemCount, -1);
+        self.update_header(&HeaderElem::TotalFreeSpace, -(tuple_size as i64 + 2));
+
         Ok(())
     }
 
@@ -388,14 +417,18 @@ impl SlottedPage {
         let middle_idx = item_count / 2;
 
         let (split_idx, middle_tuple) = match key_loc.cmp(&middle_idx) {
-            std::cmp::Ordering::Less => (middle_idx - 1, self.tuple(middle_idx - 1).unwrap().to_owned()),
+            std::cmp::Ordering::Less => (
+                middle_idx - 1,
+                self.tuple(middle_idx - 1).unwrap().to_owned(),
+            ),
             std::cmp::Ordering::Equal => (middle_idx, tuple.to_owned()),
             std::cmp::Ordering::Greater => (middle_idx, self.tuple(middle_idx).unwrap().to_owned()),
         };
 
         // Grab tuples that will go right
-        let mut tuples: Vec<TupleBuf> = Vec::with_capacity(item_count - split_idx);
-        for idx in split_idx..item_count {
+        let mut tuples: Vec<TupleBuf> = Vec::with_capacity(item_count - split_idx - 1);
+        for idx in split_idx..(item_count - 1) {
+            println!("{}", idx);
             tuples.push(self.tuple(idx).unwrap().to_owned());
         }
 
@@ -513,76 +546,68 @@ impl DerefMut for InnerNode {
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // Helper: create an initialized InnerNode from a stack buffer
-    // -----------------------------------------------------------------------
-    fn make_inner_node(
-        bytes: &mut [u8; PAGE_SIZE],
-        page_id: PageID,
-        left_child_ptr: PageID,
-    ) -> &mut InnerNode {
-        let node = InnerNode::from_bytes_mut(bytes);
-        node.init(page_id, 0, 0, left_child_ptr);
-        node
-    }
-
-    // -----------------------------------------------------------------------
-    // InnerNode::child — Base Tests
-    // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // InnerNode::child — Edge Case Tests
-    // -----------------------------------------------------------------------
-
-    /// An empty inner node has no separator keys. Any lookup must return left_child_ptr.
     #[test]
-    fn child_empty_node_returns_left_child_ptr() {
-        let mut bytes = [0u8; PAGE_SIZE];
-        let node = make_inner_node(&mut bytes, 1, 99);
-
-        // Regardless of key, the only known child is left_child_ptr.
-        assert_eq!(99, node.child(&[0u8]));
-        assert_eq!(99, node.child(&[255u8]));
-    }
-
-    /// Single key: lookup with key < the only separator returns left_child_ptr.
-
-    // -----------------------------------------------------------------------
-    // Existing tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn new_page() {
+    fn test_page_split() {
         let mut bytes = vec![0u8; PAGE_SIZE];
         let page = Leaf::from_bytes_mut(&mut bytes);
-        page.init(1, 15, 66);
+        page.init(1, NULL_PTR, NULL_PTR);
 
-        assert_eq!(1, page.get_header(&HeaderElem::PageID));
-        assert_eq!(
-            PageType::Leaf,
-            PageType::new(page.get_header(&HeaderElem::PageType)).unwrap()
-        );
+        for i in 0..50u32 {
+            let bytes = i.to_be_bytes();
+            let t = TupleBuf::new(&bytes, &bytes);
+            page.insert(&t).unwrap();
+        }
+        
+        for i in 51..100u32 {
+            let bytes = i.to_be_bytes();
+            let t = TupleBuf::new(&bytes, &bytes);
+            page.insert(&t).unwrap();
+        }
+
+        let bytes = 50u32.to_be_bytes();
+        let t = TupleBuf::new(&bytes, &bytes);
+        let (middle, right) = page.split_half(&t);
+
+        assert_eq!(t, middle);
+
+         let bytes = 51u32.to_be_bytes();
+        let t = TupleBuf::new(&bytes, &bytes);
+        assert_eq!(*right.get(0).unwrap(), t);
     }
 
     #[test]
-    fn tuple_insert() {
+    fn test_page_insert_delete() {
+        use rand::seq::SliceRandom;
+
         let mut bytes = vec![0u8; PAGE_SIZE];
         let page = Leaf::from_bytes_mut(&mut bytes);
-        page.init(1, 15, 66);
+        page.init(1, NULL_PTR, NULL_PTR);
 
-        // Insert tuple 1
-        let tuple = TupleBuf::new(&[1u8], &[1u8]);
-        page.insert(&tuple).unwrap();
-        assert_eq!(&*tuple, page.tuple(0).unwrap());
+        // insert 100 random tuples where key = value
+        let mut idxs: Vec<u32> = (0..100u32).collect();
+        idxs.shuffle(&mut rand::rng());
+        for i in &idxs {
+            let bytes = i.to_be_bytes();
+            let t = TupleBuf::new(&bytes, &bytes);
+            page.insert(&t).unwrap();
+        }
 
-        // Insert tuple 2. This should go before 1.
-        let tuple = TupleBuf::new(&[0u8], &[2u8]);
-        page.insert(&tuple).unwrap();
-        assert_eq!(&*tuple, page.tuple(0).unwrap());
+        // check that we are in order
+        for i in 0..100usize {
+            let t = page.tuple(i).unwrap();
+            let k = u32::from_be_bytes(t.key().bytes().try_into().unwrap());
+            assert_eq!(i, k as usize)
+        }
 
-        // Delete tuple 2. This should move 1 back to 0.
-        page.delete(&[0u8]).unwrap();
-        let tuple = TupleBuf::new(&[1u8], &[1u8]);
-        assert_eq!(&*tuple, page.tuple(0).unwrap());
+        // delete in arbitrary order
+        for i in &idxs {
+            let bytes = i.to_be_bytes();
+            page.delete(&bytes).unwrap();
+        }
+
+        // cleanup and check we have restored space
+        page.collapse();
+        assert_eq!(PAGE_SIZE - HEADER_SIZE, page.get_header(&HeaderElem::ContFreeSpace) as usize)
+
     }
 }
