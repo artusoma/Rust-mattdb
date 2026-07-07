@@ -65,7 +65,7 @@ impl DBReader for MemoryIO {
 
     fn new_page(&self) -> PageID {
         let mut page_lock = self.pages.lock().unwrap();
-        let new_id = (page_lock.len() + 1) as u32;
+        let new_id = page_lock.len() as u32;
         page_lock.insert(new_id, [0u8; PAGE_SIZE]);
         new_id
     }

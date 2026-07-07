@@ -428,7 +428,6 @@ impl SlottedPage {
         // Grab tuples that will go right
         let mut tuples: Vec<TupleBuf> = Vec::with_capacity(item_count - split_idx - 1);
         for idx in split_idx..(item_count - 1) {
-            println!("{}", idx);
             tuples.push(self.tuple(idx).unwrap().to_owned());
         }
 

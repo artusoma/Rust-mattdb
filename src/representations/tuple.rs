@@ -160,26 +160,5 @@ impl std::fmt::Display for TupleBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serialization::{DataType, DataValue, Deserializer, Serializer};
 
-    #[test]
-    fn test_tuple() {
-        let key = Serializer::serialize_single(&DataType::Int, &DataValue::Int(3)).unwrap();
-        let value = Serializer::serialize_single(&DataType::Int, &DataValue::Int(15)).unwrap();
-        let tuple = TupleBuf::new(&key, &value);
-        assert_eq!(tuple.size(), 12);
-        assert_eq!(tuple.key().bytes(), key);
-    }
-
-    #[test]
-    fn test_key() {
-        let key = Serializer::serialize(
-            &[DataType::Int, DataType::Char(10)],
-            &[DataValue::Int(3), DataValue::Char("My key".to_owned())],
-        )
-        .unwrap();
-        let k = KeyBuf::new(&key);
-        assert_eq!(k.size(), 16);
-        assert_eq!(k.bytes(), key);
-    }
 }

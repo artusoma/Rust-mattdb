@@ -291,6 +291,10 @@ mod tests {
     fn test_buffer_pool() {
         // Create ARC of new pool
         let pool = Arc::new(BufferPool::new(MemoryIO::default(), 1));
+        pool.new_page();
+        pool.new_page();
+
+        println!("{:?}", pool.disk_io);
 
         // Create copy (as a new thread would)
         let thread_pool = Arc::clone(&pool);
