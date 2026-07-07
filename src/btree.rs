@@ -1,15 +1,25 @@
-use crate::buffer_pool::{BufferPool, DBReader, PageID, PageRef};
+use crate::buffer_pool::{BufferPool, PageID, PageRef};
+use crate::storage::DBReader;
 use crate::representations::page::{
     HeaderElem, InnerNode, Leaf, NULL_PTR, PageReadWriteError, PageType, SlottedPage,
 };
 use crate::representations::tuple::{Tuple, TupleBuf};
 use std::sync::Arc;
 
-/// ScanIterator iterates over tuples of a page.
+
+/// Lazy range scan iterator over a B-tree's leaf node chain.
 ///
-/// After initialization with a starting page and the current slot idx being looked at,
-/// the iterator will use sibling pointers to traverse rightward grabbing new pages.
-/// As it goes it checks if the end key has been reached. If not, it returns that iterator.
+/// Iterates through tuple values in leaf nodes within a key range `[start..=end]`.
+/// Uses right-sibling pointers to traverse horizontally across leaf pages without
+/// ascending back to inner nodes, enabling efficient sequential scans.
+///
+/// Tuples are fetched on-demand as the iterator advances. The scan terminates when
+/// a tuple key exceeds the configured `end_key` or when the leaf chain is exhausted.
+///
+/// # Type Parameters
+///
+/// * `'a` - Lifetime of the `end_key` reference.
+/// * `R` - A [`DBReader`] backing the underlying [`BufferPool`].
 #[derive(Debug)]
 pub struct ScanIterator<'a, R: DBReader> {
     pool: Arc<BufferPool<R>>,
@@ -19,6 +29,14 @@ pub struct ScanIterator<'a, R: DBReader> {
 }
 
 impl<'a, R: DBReader> ScanIterator<'a, R> {
+    /// Creates a new range scan iterator.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - The buffer pool managing page storage.
+    /// * `page` - The starting leaf page for the scan.
+    /// * `end_key` - The upper bound (inclusive) for the scan range.
+    /// * `idx` - The starting tuple index within the initial page.
     fn new(pool: Arc<BufferPool<R>>, page: PageRef<R>, end_key: &'a [u8], idx: usize) -> Self {
         Self {
             pool,
@@ -32,6 +50,10 @@ impl<'a, R: DBReader> ScanIterator<'a, R> {
 impl<'a, R: DBReader> std::iter::Iterator for ScanIterator<'a, R> {
     type Item = Vec<u8>;
 
+    /// Yields the next tuple value in the scan range.
+    ///
+    /// Automatically advances to the next leaf node via right-sibling pointers when
+    /// the current page is exhausted. Stops when a key exceeds `end_key`.
     fn next(&mut self) -> Option<Self::Item> {
         // Get read lock for page to check the header
         let (ptr, item_count) = {
@@ -313,5 +335,13 @@ impl<R: DBReader> BTree<R> {
     /// As a first step, I think we can just always merge with neighbor.
     pub fn delete(&self) {
         todo!()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    fn test_tree_growth() {
+        
     }
 }

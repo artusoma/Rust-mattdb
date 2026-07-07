@@ -1,13 +1,10 @@
 use std::{
     collections::{HashMap, VecDeque},
-    ffi::{FromBytesUntilNulError, FromVecWithNulError},
-    hash::Hash,
-    io::Read,
-    ops::{Deref, DerefMut, RangeBounds},
-    path::{Path, PathBuf},
+    ops::{Deref, DerefMut},
+    path::PathBuf,
     sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard},
-    thread::LocalKey,
 };
+use crate::storage::DBReader;
 
 pub const PAGE_SIZE: usize = 8192;
 const PAGES_IN_MEMORY: usize = 1000;
@@ -139,45 +136,7 @@ pub enum BufferPoolError {
     NoFreeFrames,
 }
 
-pub trait DBReader {
-    fn write_page(&self, page_id: PageID, content: &[u8; PAGE_SIZE]);
-    fn read_page(&self, page_id: PageID) -> [u8; PAGE_SIZE];
-    fn new_page(&self) -> PageID;
-}
 
-/// Handles reading and writing from disk
-#[derive(Debug)]
-pub struct DiskIO {
-    file: PathBuf,
-    pages: usize,
-}
-
-impl DBReader for DiskIO {
-    fn read_page(&self, page_id: PageID) -> [u8; PAGE_SIZE] {
-        todo!()
-    }
-
-    fn write_page(&self, page_id: PageID, content: &[u8; PAGE_SIZE]) {
-        todo!()
-    }
-
-    fn new_page(&self) -> PageID {
-        todo!()
-    }
-}
-
-impl DiskIO {
-    fn new() -> Self {
-        DiskIO {
-            file: PathBuf::new(),
-            pages: 0,
-        }
-    }
-
-    fn offset(&self, page_id: PageID) -> usize {
-        page_id as usize * PAGE_SIZE
-    }
-}
 
 /// Only way to rest of program to interact with pages.
 /// Rest of matt-db cannot talk to disk -- it must talk to BufferPool.
@@ -197,7 +156,7 @@ pub struct BufferPool<R: DBReader> {
 }
 
 impl<R: DBReader> BufferPool<R> {
-    fn new(disk: R, size: usize) -> Self {
+    pub fn new(disk: R, size: usize) -> Self {
         Self {
             pages: std::iter::repeat_with(|| RwLock::new(PageSlot::default()))
                 .take(size)
@@ -298,26 +257,7 @@ impl<R: DBReader> BufferPool<R> {
 mod tests {
 
     use super::*;
-
-    struct MockReader;
-
-    impl MockReader {
-        fn new() -> Self {
-            Self {}
-        }
-    }
-
-    impl DBReader for MockReader {
-        fn write_page(&self, _page_id: PageID, _content: &[u8; PAGE_SIZE]) {}
-
-        fn read_page(&self, _page_id: PageID) -> [u8; PAGE_SIZE] {
-            [0u8; PAGE_SIZE]
-        }
-
-        fn new_page(&self) -> PageID {
-            todo!()
-        }
-    }
+    use super::super::storage::MemoryIO;
 
     #[test]
     fn test_evict_manager() {
@@ -350,7 +290,7 @@ mod tests {
     #[test]
     fn test_buffer_pool() {
         // Create ARC of new pool
-        let pool = Arc::new(BufferPool::new(MockReader::new(), 1));
+        let pool = Arc::new(BufferPool::new(MemoryIO::default(), 1));
 
         // Create copy (as a new thread would)
         let thread_pool = Arc::clone(&pool);

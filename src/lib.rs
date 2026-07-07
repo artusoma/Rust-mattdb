@@ -1,4 +1,7 @@
 pub mod serialization;
-pub mod buffer_pool;
+pub mod data_storage;
 pub mod btree;
 pub mod representations;
+
+use data_storage::buffer_pool;
+use data_storage::storage;
