@@ -1,11 +1,10 @@
-use crate::buffer_pool::{BufferPool, PageID, PageRef};
-use crate::storage::DBReader;
+use crate::buffer_pool::{BufferPool, ObjectID, PageID, PageRef};
 use crate::representations::page::{
     HeaderElem, InnerNode, Leaf, NULL_PTR, PageReadWriteError, PageType, SlottedPage,
 };
 use crate::representations::tuple::{Tuple, TupleBuf};
+use crate::storage::DBReader;
 use std::sync::Arc;
-
 
 /// Lazy range scan iterator over a B-tree's leaf node chain.
 ///
@@ -64,12 +63,11 @@ impl<'a, R: DBReader> std::iter::Iterator for ScanIterator<'a, R> {
             (ptr, item_count)
         };
 
-        if ptr == NULL_PTR {
-            return None;
-        }
-
         // If we are at end of leaf, grab next page and reset idx
         if self.idx >= item_count {
+            if ptr == NULL_PTR {
+                return None;
+            }
             self.page = self.pool.get_page_ref(ptr).unwrap();
             self.idx = 0;
         }
@@ -108,16 +106,23 @@ pub struct BTree<R: DBReader> {
     pool: Arc<BufferPool<R>>,
 }
 
-impl<R: DBReader> BTree<R> {
+impl<R: std::fmt::Debug + DBReader> BTree<R> {
+    fn new(pool: Arc<BufferPool<R>>) -> Self {
+        Self { pool }
+    }
+
     /// Return an iterator that iterates over tuples in leaf nodes,
     /// using sibling pointers to move laterally
     pub fn iter_scan<'a>(
         &'a self,
-        page_root: PageID,
+        object_id: ObjectID,
         start: &'a [u8],
         end: &'a [u8],
     ) -> ScanIterator<'a, R> {
-        let page = self.pool.get_page_ref(page_root).unwrap();
+        let page = self
+            .pool
+            .get_page_ref(self.pool.get_object_root(object_id))
+            .unwrap();
         let (leaf, _) = self.traverse_to_leaf(page, start, Vec::new());
 
         // Get start index of search in page
@@ -131,7 +136,13 @@ impl<R: DBReader> BTree<R> {
     /// Recursively inserts data into the page.
     ///
     /// The `page` argument may be a leaf node or a inner node
-    fn insert_recurs(&self, page: PageRef<R>, tuple: &Tuple, mut parents: Vec<PageID>) {
+    fn insert_recurs(
+        &self,
+        page: PageRef<R>,
+        object_id: ObjectID,
+        tuple: &Tuple,
+        mut parents: Vec<PageID>,
+    ) {
         // Try an insert and store the result
         let insert_result = {
             let mut write_lock = page.write().unwrap();
@@ -150,24 +161,25 @@ impl<R: DBReader> BTree<R> {
                 // This parent will either be an existing node in the tree,
                 // or a new parent node returned will have a left pointer to the original
                 // page that we split.
-                let parent_id = self.get_parent(&page, &mut parents);
+                let parent_id = self.get_parent(&page, &mut parents, object_id);
                 let parent_ref = self.pool.get_page_ref(parent_id).unwrap();
 
                 // Now insert the sibling pointer into the parent that we got
-                self.insert_recurs(parent_ref, &upstream_key, parents);
+                self.insert_recurs(parent_ref, object_id, &upstream_key, parents);
             }
             // Should not get anything else
             Err(e) => unreachable!("unexpected insert error: {e:?}"),
         }
     }
 
-    fn get_parent(&self, page: &PageRef<R>, parents: &mut Vec<PageID>) -> PageID {
+    fn get_parent(&self, page: &PageRef<R>, parents: &mut Vec<PageID>, object_id: ObjectID) -> PageID {
         match parents.pop() {
             Some(parent_id) => parent_id,
             None => {
                 // Create new root. The left child ptr will be the current page id; sibling pointers are empty (NULL_PTR)
                 let new_id = self.pool.new_page();
                 let new_page = self.pool.get_page_ref(new_id).unwrap();
+                self.pool.update_object_root(object_id, new_id);
                 InnerNode::from_bytes_mut(&mut new_page.write().unwrap()).init(
                     new_id,
                     NULL_PTR,
@@ -204,30 +216,31 @@ impl<R: DBReader> BTree<R> {
 
                 let (middle_tuple, right_tuples) = left_page_repr.split_half(tuple);
 
-                for moved_tuple in right_tuples.iter() {
-                    right_page_repr.insert(&moved_tuple).unwrap();
-                }
-
                 // Init sibling page
-                // The new left child ptr needs to be the page that the promoted
-                // middle key used to point to
                 right_page_repr.init(
                     new_sibling_id,
                     page.id(),
                     left_page_repr.get_header(&HeaderElem::RightSiblingPtr),
                 );
 
+                // Insert moved tuples into new page
+                for moved_tuple in right_tuples.iter() {
+                    right_page_repr.insert(&moved_tuple).unwrap();
+                }
+
+                // See if we insert original tuple that caused split left or right
                 match tuple.key().bytes().cmp(middle_tuple.key().bytes()) {
                     std::cmp::Ordering::Less => left_page_repr.insert(tuple).unwrap(),
                     _ => right_page_repr.insert(tuple).unwrap(),
                 }
 
+                // Update original page to point right to new sibling page
                 left_page_repr.set_header(
                     &HeaderElem::RightSiblingPtr,
                     right_page_repr.get_header(&HeaderElem::PageID),
                 );
 
-                middle_tuple
+                TupleBuf::new(middle_tuple.key().bytes(), &new_sibling_id.to_be_bytes())
             }
 
             PageType::Node => {
@@ -235,10 +248,6 @@ impl<R: DBReader> BTree<R> {
                 let right_page_repr = InnerNode::from_bytes_mut(&mut new_write_lock);
 
                 let (middle_tuple, right_tuples) = left_page_repr.split_half(tuple);
-
-                for moved_tuple in right_tuples.iter() {
-                    right_page_repr.insert(&moved_tuple).unwrap();
-                }
 
                 // Init sibling page
                 // The new left child ptr needs to be the page that the promoted
@@ -250,6 +259,12 @@ impl<R: DBReader> BTree<R> {
                     u32::from_be_bytes(middle_tuple.value().try_into().unwrap()),
                 );
 
+                for moved_tuple in right_tuples.iter() {
+                    right_page_repr.insert(&moved_tuple).unwrap();
+                }
+
+                // Check if we insert original key left or right; or, if it is the middle key,
+                // it gets promoted to the parent and does appear in the children
                 match tuple.key().bytes().cmp(middle_tuple.key().bytes()) {
                     // Insert into left
                     std::cmp::Ordering::Less => left_page_repr.insert(tuple).unwrap(),
@@ -267,16 +282,17 @@ impl<R: DBReader> BTree<R> {
         }
     }
 
-    pub fn insert_tuple(&self, page_root: PageID, tuple: &Tuple) {
+    pub fn insert_tuple(&self, object_id: ObjectID, tuple: &Tuple) {
         // Get leaf page if not leaf page
+        let root_id = self.pool.get_object_root(object_id);
         let (leaf, parents) = self.traverse_to_leaf(
-            self.pool.get_page_ref(page_root).unwrap(),
+            self.pool.get_page_ref(root_id).unwrap(),
             tuple.key().bytes(),
             Vec::new(),
         );
 
         // Call insert page which may become recursive if parents need to be split
-        self.insert_recurs(leaf, tuple, parents);
+        self.insert_recurs(leaf, object_id, tuple, parents);
     }
 
     /// Traverses the tree from `page` downward, following child pointers in inner
@@ -338,10 +354,43 @@ impl<R: DBReader> BTree<R> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    fn test_tree_growth() {
-        
+    use super::*;
+    use crate::buffer_pool::BufferPool;
+    use crate::representations::page::{Leaf, NULL_PTR};
+    use crate::storage::MemoryIO;
+
+    #[test]
+    fn test_tree_growth_and_scan() {
+        let pool = Arc::new(BufferPool::new(MemoryIO::default(), 1000));
+        let (object_id, root) = pool.new_object_root();
+
+        {
+            let root_ref = pool.get_page_ref(root).unwrap();
+            let mut root_lock = root_ref.write().unwrap();
+            let root_repr = Leaf::from_bytes_mut(&mut root_lock);
+            root_repr.init(root, NULL_PTR, NULL_PTR);
+        }
+
+        let tree = BTree::new(pool);
+
+        for i in 0..10000u32 {
+            let v = i.to_be_bytes();
+            tree.insert_tuple(object_id, &TupleBuf::new(&v, &v));
+            // println!("{}", i);
+        }
+
+        // for v in tree.iter_scan(root, &0u32.to_be_bytes(), &1000u32.to_be_bytes()) {
+        //     println!("{}", u32::from_be_bytes(v.try_into().unwrap()))
+        // }
+
+        // for v in tree.iter_scan(root, &5u32.to_be_bytes(), &12u32.to_be_bytes()) {
+        //     println!("{}", u32::from_be_bytes(v.try_into().unwrap()))
+        // }
+
+        for v in tree.iter_scan(object_id, &0u32.to_be_bytes(), &500u32.to_be_bytes()) {
+            println!("{}", u32::from_be_bytes(v.try_into().unwrap()))
+        }
     }
 }

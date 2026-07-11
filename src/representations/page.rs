@@ -1,9 +1,9 @@
 use std::ops::{Deref, DerefMut};
 
 use super::tuple::*;
-use crate::buffer_pool::{PAGE_SIZE, PageID};
+use crate::buffer_pool::{PAGE_SIZE};
 
-pub const NULL_PTR: PageID = PageID::MAX;
+pub const NULL_PTR: u32 = u32::MAX;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PageReadWriteError {
@@ -134,11 +134,11 @@ impl SlottedPage {
 
     pub fn init(
         &mut self,
-        page_id: PageID,
+        page_id: u32,
         page_type: PageType,
-        left_ptr: PageID,
-        right_ptr: PageID,
-        left_child_ptr: PageID,
+        left_ptr: u32,
+        right_ptr: u32,
+        left_child_ptr: u32,
     ) {
         self.set_header(&HeaderElem::PageID, page_id.try_into().unwrap());
         self.set_header(&HeaderElem::PageType, page_type.id().try_into().unwrap());
@@ -453,7 +453,7 @@ impl Leaf {
         unsafe { &mut *(bytes as *mut [u8] as *mut SlottedPage as *mut Leaf) }
     }
 
-    pub fn init(&mut self, page_id: PageID, left_ptr: PageID, right_ptr: PageID) {
+    pub fn init(&mut self, page_id: u32, left_ptr: u32, right_ptr: u32) {
         self.0
             .init(page_id, PageType::Leaf, left_ptr, right_ptr, NULL_PTR);
     }
@@ -491,10 +491,10 @@ impl InnerNode {
 
     pub fn init(
         &mut self,
-        page_id: PageID,
-        left_ptr: PageID,
-        right_ptr: PageID,
-        left_child_ptr: PageID,
+        page_id: u32,
+        left_ptr: u32,
+        right_ptr: u32,
+        left_child_ptr: u32,
     ) {
         self.0
             .init(page_id, PageType::Node, left_ptr, right_ptr, left_child_ptr);
@@ -510,7 +510,7 @@ impl InnerNode {
     /// - If `key = 4` => value at `idx = 0`, but `find_partition` returns `1`
     /// - If `key = 5` => value at `idx = 0`, but `find_partition` returns `1`
     /// - If `key = 7` => value at `idx = 1`, but `find_partition` returns `2`
-    pub fn child(&self, key: &[u8]) -> PageID {
+    pub fn child(&self, key: &[u8]) -> u32 {
         let found_idx = self.0.find_partition(key);
         if found_idx == 0 {
             self.0.get_header(&HeaderElem::LeftChildPtr)
@@ -569,7 +569,7 @@ mod tests {
 
         assert_eq!(t, middle);
 
-         let bytes = 51u32.to_be_bytes();
+        let bytes = 51u32.to_be_bytes();
         let t = TupleBuf::new(&bytes, &bytes);
         assert_eq!(*right.get(0).unwrap(), t);
     }

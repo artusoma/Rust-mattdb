@@ -1,16 +1,17 @@
+use crate::storage::DBReader;
 use std::{
     collections::{HashMap, VecDeque},
     ops::{Deref, DerefMut},
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard, RwLock, RwLockWriteGuard},
 };
-use crate::storage::DBReader;
 
 pub const PAGE_SIZE: usize = 8192;
 const PAGES_IN_MEMORY: usize = 1000;
 
 // Types because I keep getting confused
 pub type PageID = u32;
+pub type ObjectID = u32;
 pub type Frame = usize;
 
 #[derive(Debug, Clone)]
@@ -136,8 +137,6 @@ pub enum BufferPoolError {
     NoFreeFrames,
 }
 
-
-
 /// Only way to rest of program to interact with pages.
 /// Rest of matt-db cannot talk to disk -- it must talk to BufferPool.
 ///
@@ -153,6 +152,8 @@ pub struct BufferPool<R: DBReader> {
     evict_manager: EvictManager,
     /// Helper to read and write
     disk_io: R,
+    /// Mapping from available object ids to root page
+    dbobjects: RwLock<HashMap<u32, PageID>>,
 }
 
 impl<R: DBReader> BufferPool<R> {
@@ -164,6 +165,7 @@ impl<R: DBReader> BufferPool<R> {
             page_table: RwLock::new(HashMap::new()),
             evict_manager: EvictManager::new(size),
             disk_io: disk,
+            dbobjects: RwLock::new(HashMap::new()),
         }
     }
 
@@ -187,6 +189,29 @@ impl<R: DBReader> BufferPool<R> {
         if page.pins == 1 {
             self.evict_manager.remove_from_queue(self.frame(page_id));
         }
+    }
+
+    /// Create a new object, returning a PageID for it
+    pub fn new_object_root(self: &Arc<Self>) -> (ObjectID, PageID) {
+        let page_id: PageID = self.new_page();
+
+        // Get a lock
+        let mut obj_lock = self.dbobjects.write().unwrap();
+        let object_id: ObjectID = obj_lock.len() as ObjectID;
+        obj_lock.insert(object_id, page_id);
+
+        (object_id, page_id)
+    }
+
+    /// Get an object root page id
+    pub fn get_object_root(self: &Arc<Self>, object_id: ObjectID) -> PageID {
+        let obj_lock = self.dbobjects.read().unwrap();
+        *obj_lock.get(&object_id).unwrap()
+    }
+
+    pub fn update_object_root(self: &Arc<Self>, object_id: ObjectID, new_root: PageID) {
+        let mut obj_lock = self.dbobjects.write().unwrap();
+        obj_lock.insert(object_id, new_root);
     }
 
     /// Only let people call this when managed by an Arc
@@ -228,7 +253,7 @@ impl<R: DBReader> BufferPool<R> {
                 page_write.load_new(page_id, self.read_page(page_id));
 
                 Ok(PageRef {
-                    pool: Arc::clone(self), //self.clone() can also work, but Arc::clone is explicit and safer
+                    pool: Arc::clone(self),
                     page_id: page_id,
                 })
             }
@@ -256,8 +281,8 @@ impl<R: DBReader> BufferPool<R> {
 #[cfg(test)]
 mod tests {
 
-    use super::*;
     use super::super::storage::MemoryIO;
+    use super::*;
 
     #[test]
     fn test_evict_manager() {
@@ -293,8 +318,6 @@ mod tests {
         let pool = Arc::new(BufferPool::new(MemoryIO::default(), 1));
         pool.new_page();
         pool.new_page();
-
-        println!("{:?}", pool.disk_io);
 
         // Create copy (as a new thread would)
         let thread_pool = Arc::clone(&pool);

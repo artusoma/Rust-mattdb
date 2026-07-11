@@ -29,6 +29,7 @@ impl ToOwned for Key {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub struct KeyBuf {
     bytes: Vec<u8>,
 }
