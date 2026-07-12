@@ -128,7 +128,7 @@ impl<R: std::fmt::Debug + DBReader> BTree<R> {
         // Get start index of search in page
         let start_idx = {
             let lock = leaf.read().unwrap();
-            Leaf::from_bytes(&lock).find_partition(start)
+            Leaf::from_bytes(&lock).find_partition_lower(start)
         };
         ScanIterator::new(Arc::clone(&self.pool), leaf, end, start_idx)
     }

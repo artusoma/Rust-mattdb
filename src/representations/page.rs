@@ -1,7 +1,8 @@
 use std::ops::{Deref, DerefMut};
 
+use super::search::{BinarySearch, LowerPartitionSearch, UpperPartitionSearch};
 use super::tuple::*;
-use crate::buffer_pool::PAGE_SIZE;
+use crate::{buffer_pool::PAGE_SIZE, representations::search::SearchStrategy};
 
 pub const NULL_PTR: u32 = u32::MAX;
 
@@ -174,85 +175,44 @@ impl SlottedPage {
     }
 
     pub fn find_key(&self, key: &[u8]) -> Option<usize> {
-        let count = self.get_header(&HeaderElem::ItemCount);
+        let count = self.get_header(&HeaderElem::ItemCount) as usize;
         if count == 0 {
             None
         } else {
-            self.find_key_inner(key, 0, self.get_header(&HeaderElem::ItemCount) as usize - 1)
+            BinarySearch::default().search(
+                |idx| self.tuple(idx).unwrap().key().bytes(),
+                key,
+                0,
+                count - 1,
+            )
         }
     }
 
-    fn find_key_inner(&self, key: &[u8], mut low: usize, mut high: usize) -> Option<usize> {
-        loop {
-            let idx = low + (high - low) / 2;
-
-            let this_key = self.tuple(idx).unwrap().key().bytes();
-
-            if high == low {
-                return if this_key == key { Some(high) } else { None };
-            }
-
-            match this_key.cmp(key) {
-                std::cmp::Ordering::Equal => return Some(idx),
-                std::cmp::Ordering::Less => low = idx + 1,
-                std::cmp::Ordering::Greater => {
-                    if idx == low {
-                        high = high - 1;
-                    } else {
-                        high = idx - 1;
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn find_partition(&self, key: &[u8]) -> usize {
-        let count = self.get_header(&HeaderElem::ItemCount);
+    pub fn find_partition_upper(&self, key: &[u8]) -> usize {
+        let count = self.get_header(&HeaderElem::ItemCount) as usize;
         if count == 0 {
             0
         } else {
-            self.find_partition_inner(key, 0, count as usize - 1)
+            UpperPartitionSearch::default().search(
+                |idx| self.tuple(idx).unwrap().key().bytes(),
+                key,
+                0,
+                count - 1,
+            ).unwrap()
         }
     }
 
-    /// Returns the index at which `key` should be inserted to keep the slot array sorted,
-    /// searching within the inclusive index range `[low, high]`.
-    ///
-    /// For a page containing keys `[3, 5, 5, 7]`:
-    /// - `key = 2` → `0` (insert before everything)
-    /// - `key = 5` → `3` (insert after the last `5`, preserving append order for duplicates)
-    /// - `key = 9` → `4` (insert after everything)
-    ///
-    /// The implementation is an iterative binary search. Each branch narrows the window:
-    /// - `Less`: raise `low` past the midpoint — `key` belongs to the right.
-    /// - `Equal`: lower `high` to the midpoint — scan left to find the first match,
-    ///   so the returned index lands after all equal keys.
-    /// - `Greater`: lower `high` below the midpoint — `key` belongs to the left.
-    ///   Returns `0` immediately when `idx == 0` to avoid underflow.
-    fn find_partition_inner(&self, key: &[u8], mut low: usize, mut high: usize) -> usize {
-        loop {
-            let idx = low + (high - low) / 2;
-
-            let this_key = self.tuple(idx).unwrap().key().bytes();
-            if high == low {
-                return match this_key.cmp(key) {
-                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal => idx + 1,
-                    _ => idx,
-                };
-            }
-            match this_key.cmp(key) {
-                std::cmp::Ordering::Equal => {
-                    high = idx;
-                }
-                std::cmp::Ordering::Less => low = idx + 1,
-                std::cmp::Ordering::Greater => {
-                    if idx == low {
-                        high = high - 1
-                    } else {
-                        high = idx - 1;
-                    }
-                }
-            }
+    pub fn find_partition_lower(&self, key: &[u8]) -> usize {
+        let count = self.get_header(&HeaderElem::ItemCount) as usize;
+        if count == 0 {
+            0
+        } else {
+            LowerPartitionSearch::default().search(
+                |idx| self.tuple(idx).unwrap().key().bytes(),
+                key,
+                0,
+                count - 1,
+            ).unwrap()
         }
     }
 
@@ -291,7 +251,7 @@ impl SlottedPage {
 
         // Get slot write ptr and tuple write ptr
         let tuple_write_ptr = self.get_header(&HeaderElem::FreeSpacePtr) as usize - data.len();
-        let slot_write_idx = self.find_partition(data.key().bytes());
+        let slot_write_idx = self.find_partition_upper(data.key().bytes());
 
         // I think the safest order is probably write out Tuple, then Slot, then update headers?
         // Write first
@@ -412,7 +372,7 @@ impl SlottedPage {
         let item_count = self.get_header(&HeaderElem::ItemCount) as usize + 1;
 
         // Get idx where this key would go
-        let key_loc = self.find_partition(&tuple.key().bytes());
+        let key_loc = self.find_partition_upper(&tuple.key().bytes());
         let middle_idx = item_count / 2;
 
         let (split_idx, middle_tuple) = match key_loc.cmp(&middle_idx) {
@@ -504,7 +464,7 @@ impl InnerNode {
     /// - If `key = 5` => value at `idx = 0`, but `find_partition` returns `1`
     /// - If `key = 7` => value at `idx = 1`, but `find_partition` returns `2`
     pub fn child(&self, key: &[u8]) -> u32 {
-        let found_idx = self.0.find_partition(key);
+        let found_idx = self.0.find_partition_upper(key);
         if found_idx == 0 {
             self.0.get_header(&HeaderElem::LeftChildPtr)
         } else {

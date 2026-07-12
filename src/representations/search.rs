@@ -15,10 +15,9 @@ pub trait SearchStrategy<T: Ord> {
 
     fn on_convergence(&self, idx: usize, cmp: std::cmp::Ordering) -> Option<usize>;
 
-    fn search<'a, F>(&self, get_key: F, key: &T, start: usize, end: usize) -> Option<usize>
+    fn search<'a, F>(&self, get_key: F, key: T, start: usize, end: usize) -> Option<usize>
     where
-        F: Fn(usize) -> &'a T,
-        T: 'a
+        F: Fn(usize) -> T,
     {
         let mut low = start;
         let mut high = end;
@@ -176,12 +175,12 @@ mod tests {
         let vec: Vec<i32> = vec![2, 5, 5, 5, 7];
         let strat = UpperPartitionSearch::default();
 
-        assert_eq!(Some(0), strat.search(|i| vec.get(i).unwrap(), &0, 0, 4));
-        assert_eq!(Some(1), strat.search(|i| vec.get(i).unwrap(), &2, 0, 4));
-        assert_eq!(Some(1), strat.search(|i| vec.get(i).unwrap(), &3, 0, 4));
-        assert_eq!(Some(4), strat.search(|i| vec.get(i).unwrap(), &5, 0, 4));
-        assert_eq!(Some(4), strat.search(|i| vec.get(i).unwrap(), &6, 0, 4));
-        assert_eq!(Some(5), strat.search(|i| vec.get(i).unwrap(), &7, 0, 4));
-        assert_eq!(Some(5), strat.search(|i| vec.get(i).unwrap(), &9, 0, 4));
+        assert_eq!(Some(0), strat.search(|i| *vec.get(i).unwrap(), 0, 0, 4));
+        assert_eq!(Some(1), strat.search(|i| *vec.get(i).unwrap(), 2, 0, 4));
+        assert_eq!(Some(1), strat.search(|i| *vec.get(i).unwrap(), 3, 0, 4));
+        assert_eq!(Some(4), strat.search(|i| *vec.get(i).unwrap(), 5, 0, 4));
+        assert_eq!(Some(4), strat.search(|i| *vec.get(i).unwrap(), 6, 0, 4));
+        assert_eq!(Some(5), strat.search(|i| *vec.get(i).unwrap(), 7, 0, 4));
+        assert_eq!(Some(5), strat.search(|i| *vec.get(i).unwrap(), 9, 0, 4));
     }
 }
