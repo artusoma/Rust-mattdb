@@ -366,8 +366,6 @@ mod tests {
     use crate::representations::page::{Leaf, NULL_PTR};
     use crate::storage::MemoryIO;
     use proptest::prelude::*;
-    use proptest::sample::SizeRange;
-    use rand::seq::SliceRandom;
 
     fn create_test_tree() -> (BTree<MemoryIO>, ObjectID) {
         let pool = Arc::new(BufferPool::new(MemoryIO::default(), 1000));
@@ -401,31 +399,26 @@ mod tests {
                 tree.insert_tuple(object_id, &TupleBuf::new(&elem_bytes, &elem_bytes));
             }
 
-            let scanned: Vec<u32> = tree.iter_scan(object_id, &v.iter().min().unwrap().to_be_bytes(), &v.iter().max().unwrap().to_be_bytes()).map(|b| u32::from_be_bytes(b.try_into().unwrap())).collect();
-            assert!(scanned.is_sorted())
+            let vector_min = v.iter().min().unwrap();
+            let vector_max = v.iter().max().unwrap();
+            let scanned: Vec<u32> = tree
+                .iter_scan(object_id, &0u32.to_be_bytes(), &vector_max.to_be_bytes())
+                .map(|b| u32::from_be_bytes(b.try_into().unwrap())).collect();
+            assert!(scanned.is_sorted());
+            assert_eq!(vector_min, scanned.first().unwrap());
+            assert_eq!(vector_max, scanned.last().unwrap())
         }
     }
 
     #[test]
-    fn test_tree_growth_and_scan() {
-        let (tree, object_id) = create_test_tree();
+    fn test_empty_scan() {
+        let (tree, obj_id) = create_test_tree();
 
-        for i in 0..5u32 {
-            let v = i.to_be_bytes();
-            tree.insert_tuple(object_id, &TupleBuf::new(&v, &v));
-            // println!("{}", i);
-        }
+        let scanned: Vec<u32> = tree
+            .iter_scan(obj_id, &0u32.to_be_bytes(), &1000u32.to_be_bytes())
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+            .collect();
 
-        // for v in tree.iter_scan(root, &0u32.to_be_bytes(), &1000u32.to_be_bytes()) {
-        //     println!("{}", u32::from_be_bytes(v.try_into().unwrap()))
-        // }
-
-        // for v in tree.iter_scan(root, &5u32.to_be_bytes(), &12u32.to_be_bytes()) {
-        //     println!("{}", u32::from_be_bytes(v.try_into().unwrap()))
-        // }
-
-        for v in tree.iter_scan(object_id, &0u32.to_be_bytes(), &500u32.to_be_bytes()) {
-            println!("{}", u32::from_be_bytes(v.try_into().unwrap()))
-        }
+        assert!(scanned.is_empty())
     }
 }
