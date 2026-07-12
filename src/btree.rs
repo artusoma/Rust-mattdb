@@ -391,26 +391,26 @@ mod tests {
             .prop_shuffle()
     }
 
-    // proptest! {
-    //     #[test]
-    //     fn test_tree_order(v in unique_shuffled_vec(1..10000)) {
-    //         let (tree, object_id) = create_test_tree();
+    proptest! {
+        #[test]
+        fn test_tree_order(v in unique_shuffled_vec(1..10000)) {
+            let (tree, object_id) = create_test_tree();
 
-    //         for elem in v.iter() {
-    //             let elem_bytes = elem.to_be_bytes();
-    //             tree.insert_tuple(object_id, &TupleBuf::new(&elem_bytes, &elem_bytes));
-    //         }
+            for elem in v.iter() {
+                let elem_bytes = elem.to_be_bytes();
+                tree.insert_tuple(object_id, &TupleBuf::new(&elem_bytes, &elem_bytes));
+            }
 
-    //         let scanned: Vec<u32> = tree.iter_scan(object_id, &v.iter().min().unwrap().to_be_bytes(), &v.iter().max().unwrap().to_be_bytes()).map(|b| u32::from_be_bytes(b.try_into().unwrap())).collect();
-    //         assert!(scanned.is_sorted())
-    //     }
-    // }
+            let scanned: Vec<u32> = tree.iter_scan(object_id, &v.iter().min().unwrap().to_be_bytes(), &v.iter().max().unwrap().to_be_bytes()).map(|b| u32::from_be_bytes(b.try_into().unwrap())).collect();
+            assert!(scanned.is_sorted())
+        }
+    }
 
     #[test]
     fn test_tree_growth_and_scan() {
         let (tree, object_id) = create_test_tree();
 
-        for i in 0..1u32 {
+        for i in 0..5u32 {
             let v = i.to_be_bytes();
             tree.insert_tuple(object_id, &TupleBuf::new(&v, &v));
             // println!("{}", i);
