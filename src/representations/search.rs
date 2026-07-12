@@ -58,7 +58,7 @@ pub trait SearchStrategy<T: Ord> {
     /// let strategy = BinarySearch::default();
     /// let result = strategy.search(|i| vec[i], 5, 0, 3);
     /// ```
-    fn search<'a, F>(&self, get_key: F, key: T, start: usize, end: usize) -> Option<usize>
+    fn search<F>(&self, get_key: F, key: T, start: usize, end: usize) -> Option<usize>
     where
         F: Fn(usize) -> T,
     {
