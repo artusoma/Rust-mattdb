@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, ops::Deref};
+use std::ops::Deref;
 
 /// DST represnting a key in data.
 ///
@@ -53,7 +53,6 @@ impl Deref for KeyBuf {
 }
 
 impl std::borrow::Borrow<Key> for KeyBuf {
-
     fn borrow(&self) -> &Key {
         Key::from_bytes(&self.bytes)
     }
@@ -113,7 +112,9 @@ impl ToOwned for Tuple {
     type Owned = TupleBuf;
 
     fn to_owned(&self) -> Self::Owned {
-        TupleBuf {bytes: self.0.to_vec()}
+        TupleBuf {
+            bytes: self.0.to_vec(),
+        }
     }
 }
 
@@ -146,7 +147,6 @@ impl Deref for TupleBuf {
 }
 
 impl std::borrow::Borrow<Tuple> for TupleBuf {
-    
     fn borrow(&self) -> &Tuple {
         Tuple::from_bytes(&self.bytes)
     }
@@ -160,6 +160,5 @@ impl std::fmt::Display for TupleBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    // use super::*;
 }

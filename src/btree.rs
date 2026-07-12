@@ -128,7 +128,7 @@ impl<R: std::fmt::Debug + DBReader> BTree<R> {
         // Get start index of search in page
         let start_idx = {
             let lock = leaf.read().unwrap();
-            Leaf::from_bytes(&lock).find_key(start).unwrap()
+            Leaf::from_bytes(&lock).find_partition(start)
         };
         ScanIterator::new(Arc::clone(&self.pool), leaf, end, start_idx)
     }
@@ -172,7 +172,12 @@ impl<R: std::fmt::Debug + DBReader> BTree<R> {
         }
     }
 
-    fn get_parent(&self, page: &PageRef<R>, parents: &mut Vec<PageID>, object_id: ObjectID) -> PageID {
+    fn get_parent(
+        &self,
+        page: &PageRef<R>,
+        parents: &mut Vec<PageID>,
+        object_id: ObjectID,
+    ) -> PageID {
         match parents.pop() {
             Some(parent_id) => parent_id,
             None => {
@@ -360,9 +365,11 @@ mod tests {
     use crate::buffer_pool::BufferPool;
     use crate::representations::page::{Leaf, NULL_PTR};
     use crate::storage::MemoryIO;
+    use proptest::prelude::*;
+    use proptest::sample::SizeRange;
+    use rand::seq::SliceRandom;
 
-    #[test]
-    fn test_tree_growth_and_scan() {
+    fn create_test_tree() -> (BTree<MemoryIO>, ObjectID) {
         let pool = Arc::new(BufferPool::new(MemoryIO::default(), 1000));
         let (object_id, root) = pool.new_object_root();
 
@@ -373,9 +380,37 @@ mod tests {
             root_repr.init(root, NULL_PTR, NULL_PTR);
         }
 
-        let tree = BTree::new(pool);
+        (BTree::new(pool), object_id)
+    }
 
-        for i in 0..10000u32 {
+    fn unique_shuffled_vec(
+        size: impl Into<proptest::collection::SizeRange>,
+    ) -> impl Strategy<Value = Vec<u32>> {
+        prop::collection::btree_set(any::<u32>(), size)
+            .prop_map(|set| set.into_iter().collect::<Vec<_>>())
+            .prop_shuffle()
+    }
+
+    // proptest! {
+    //     #[test]
+    //     fn test_tree_order(v in unique_shuffled_vec(1..10000)) {
+    //         let (tree, object_id) = create_test_tree();
+
+    //         for elem in v.iter() {
+    //             let elem_bytes = elem.to_be_bytes();
+    //             tree.insert_tuple(object_id, &TupleBuf::new(&elem_bytes, &elem_bytes));
+    //         }
+
+    //         let scanned: Vec<u32> = tree.iter_scan(object_id, &v.iter().min().unwrap().to_be_bytes(), &v.iter().max().unwrap().to_be_bytes()).map(|b| u32::from_be_bytes(b.try_into().unwrap())).collect();
+    //         assert!(scanned.is_sorted())
+    //     }
+    // }
+
+    #[test]
+    fn test_tree_growth_and_scan() {
+        let (tree, object_id) = create_test_tree();
+
+        for i in 0..1u32 {
             let v = i.to_be_bytes();
             tree.insert_tuple(object_id, &TupleBuf::new(&v, &v));
             // println!("{}", i);

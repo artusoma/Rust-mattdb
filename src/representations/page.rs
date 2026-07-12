@@ -1,7 +1,7 @@
 use std::ops::{Deref, DerefMut};
 
 use super::tuple::*;
-use crate::buffer_pool::{PAGE_SIZE};
+use crate::buffer_pool::PAGE_SIZE;
 
 pub const NULL_PTR: u32 = u32::MAX;
 
@@ -199,7 +199,7 @@ impl SlottedPage {
                     if idx == low {
                         high = high - 1;
                     } else {
-                        high = idx - 1;   
+                        high = idx - 1;
                     }
                 }
             }
@@ -211,7 +211,7 @@ impl SlottedPage {
         if count == 0 {
             0
         } else {
-            self.find_partition_inner(key, 0, self.get_header(&HeaderElem::ItemCount) as usize - 1)
+            self.find_partition_inner(key, 0, count as usize - 1)
         }
     }
 
@@ -375,7 +375,6 @@ impl SlottedPage {
             self.0.copy_within(start_ptr..end_ptr, start_ptr - 2);
         }
 
-
         // Set new item count and free space
         self.update_header(&HeaderElem::ItemCount, -1);
         self.update_header(&HeaderElem::TotalFreeSpace, -(tuple_size as i64 + 2));
@@ -489,13 +488,7 @@ impl InnerNode {
         unsafe { &mut *(bytes as *mut [u8] as *mut SlottedPage as *mut InnerNode) }
     }
 
-    pub fn init(
-        &mut self,
-        page_id: u32,
-        left_ptr: u32,
-        right_ptr: u32,
-        left_child_ptr: u32,
-    ) {
+    pub fn init(&mut self, page_id: u32, left_ptr: u32, right_ptr: u32, left_child_ptr: u32) {
         self.0
             .init(page_id, PageType::Node, left_ptr, right_ptr, left_child_ptr);
     }
@@ -556,7 +549,7 @@ mod tests {
             let t = TupleBuf::new(&bytes, &bytes);
             page.insert(&t).unwrap();
         }
-        
+
         for i in 51..100u32 {
             let bytes = i.to_be_bytes();
             let t = TupleBuf::new(&bytes, &bytes);
@@ -606,7 +599,9 @@ mod tests {
 
         // cleanup and check we have restored space
         page.collapse();
-        assert_eq!(PAGE_SIZE - HEADER_SIZE, page.get_header(&HeaderElem::ContFreeSpace) as usize)
-
+        assert_eq!(
+            PAGE_SIZE - HEADER_SIZE,
+            page.get_header(&HeaderElem::ContFreeSpace) as usize
+        )
     }
 }
