@@ -2,18 +2,21 @@ use std::ops::{Deref, DerefMut};
 
 use super::search::{BinarySearch, LowerPartitionSearch, UpperPartitionSearch};
 use super::tuple::*;
+use crate::representations::search::UniqueSearch;
 use crate::{buffer_pool::PAGE_SIZE, representations::search::SearchStrategy};
 
 pub const NULL_PTR: u32 = u32::MAX;
 
-#[derive(Debug, thiserror::Error)]
-pub enum PageReadWriteError {
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum PageError {
     #[error("Page is out of space for insert")]
     OutOfSpace,
-    #[error("Cannot find specified key (bytes: {0})")]
-    KeyNotFound(String),
+    #[error("Cannot find specified key")]
+    KeyNotFound(Vec<u8>),
     #[error("Page type error: cannot interpret page type `{0}`")]
     PageTypeError(u32),
+    #[error("Key already exists")]
+    PrimaryKeyError(Vec<u8>),
 }
 
 pub enum HeaderElem {
@@ -65,17 +68,17 @@ impl PageType {
         }
     }
 
-    pub fn new(type_id: u32) -> Result<Self, PageReadWriteError> {
+    pub fn new(type_id: u32) -> Result<Self, PageError> {
         match type_id {
             0 => Ok(Self::Node),
             1 => Ok(Self::Leaf),
-            _ => Err(PageReadWriteError::PageTypeError(type_id)),
+            _ => Err(PageError::PageTypeError(type_id)),
         }
     }
 }
 
 impl TryFrom<u32> for PageType {
-    type Error = PageReadWriteError;
+    type Error = PageError;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         PageType::new(value)
@@ -193,12 +196,28 @@ impl SlottedPage {
         if count == 0 {
             0
         } else {
-            UpperPartitionSearch::default().search(
+            UpperPartitionSearch::default()
+                .search(
+                    |idx| self.tuple(idx).unwrap().key().bytes(),
+                    key,
+                    0,
+                    count - 1,
+                )
+                .unwrap()
+        }
+    }
+
+    pub fn find_insert_idx(&self, key: &[u8]) -> Option<usize> {
+        let count = self.get_header(&HeaderElem::ItemCount) as usize;
+        if count == 0 {
+            Some(0)
+        } else {
+            UniqueSearch::default().search(
                 |idx| self.tuple(idx).unwrap().key().bytes(),
                 key,
                 0,
                 count - 1,
-            ).unwrap()
+            )
         }
     }
 
@@ -207,12 +226,14 @@ impl SlottedPage {
         if count == 0 {
             0
         } else {
-            LowerPartitionSearch::default().search(
-                |idx| self.tuple(idx).unwrap().key().bytes(),
-                key,
-                0,
-                count - 1,
-            ).unwrap()
+            LowerPartitionSearch::default()
+                .search(
+                    |idx| self.tuple(idx).unwrap().key().bytes(),
+                    key,
+                    0,
+                    count - 1,
+                )
+                .unwrap()
         }
     }
 
@@ -241,17 +262,19 @@ impl SlottedPage {
         }
     }
 
-    pub fn insert(&mut self, data: &Tuple) -> Result<(), PageReadWriteError> {
+    pub fn insert(&mut self, data: &Tuple) -> Result<(), PageError> {
         // We need to check how much space we have.
         match self.check_space(data.len() + 2usize) {
             SpaceStatus::Ok => {}
             SpaceStatus::NeedsCollapse => self.collapse(),
-            SpaceStatus::OutOfSpace => return Err(PageReadWriteError::OutOfSpace),
+            SpaceStatus::OutOfSpace => return Err(PageError::OutOfSpace),
         }
 
         // Get slot write ptr and tuple write ptr
         let tuple_write_ptr = self.get_header(&HeaderElem::FreeSpacePtr) as usize - data.len();
-        let slot_write_idx = self.find_partition_upper(data.key().bytes());
+        let slot_write_idx = self
+            .find_insert_idx(data.key().bytes())
+            .ok_or(PageError::PrimaryKeyError(data.key().bytes().into()))?;
 
         // I think the safest order is probably write out Tuple, then Slot, then update headers?
         // Write first
@@ -317,10 +340,10 @@ impl SlottedPage {
     ///   and its 2-byte slot.
     /// - Leaves the tuple data and any gaps in memory (fragmentation). Use [`collapse`](Self::collapse)
     ///   to reclaim fragmented space.
-    pub fn delete(&mut self, key: &[u8]) -> Result<(), PageReadWriteError> {
+    pub fn delete(&mut self, key: &[u8]) -> Result<(), PageError> {
         let delete_idx = self
             .find_key(key)
-            .ok_or(PageReadWriteError::KeyNotFound(format!("{:?}", key)))?;
+            .ok_or(PageError::KeyNotFound(key.into()))?;
 
         // Get size of tuple to mark the free space
         let tuple_size = self.tuple(delete_idx).unwrap().size();
@@ -563,5 +586,20 @@ mod tests {
             PAGE_SIZE - HEADER_SIZE,
             page.get_header(&HeaderElem::ContFreeSpace) as usize
         )
+    }
+
+    #[test]
+    fn test_primary_key_error() {
+        let mut bytes = vec![0u8; PAGE_SIZE];
+        let page = Leaf::from_bytes_mut(&mut bytes);
+        page.init(1, NULL_PTR, NULL_PTR);
+
+        let t = TupleBuf::new(&0u32.to_be_bytes(), &0u32.to_be_bytes());
+
+        assert!(page.insert(&t).is_ok());
+        assert_eq!(
+            page.insert(&t),
+            Err(PageError::PrimaryKeyError(t.key().bytes().into()))
+        );
     }
 }

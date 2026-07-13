@@ -1,6 +1,6 @@
 use crate::buffer_pool::{BufferPool, ObjectID, PageID, PageRef};
 use crate::representations::page::{
-    HeaderElem, InnerNode, Leaf, NULL_PTR, PageReadWriteError, PageType, SlottedPage,
+    HeaderElem, InnerNode, Leaf, NULL_PTR, PageError, PageType, SlottedPage,
 };
 use crate::representations::tuple::{Tuple, TupleBuf};
 use crate::storage::DBReader;
@@ -154,7 +154,7 @@ impl<R: std::fmt::Debug + DBReader> BTree<R> {
         // If not, we need to get the parent and insert there.
         match insert_result {
             Ok(_) => {}
-            Err(PageReadWriteError::OutOfSpace) => {
+            Err(PageError::OutOfSpace) => {
                 // Do an insert and split, getting what we need to insert into parent
                 let upstream_key = self.split_and_insert(&page, &tuple);
 
