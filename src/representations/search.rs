@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 
+#[derive(Debug)]
 pub enum SearchStatus {
     Bounds(usize, usize),
     Found(usize),
@@ -16,7 +17,7 @@ use SearchStatus::*;
 /// Implementations customize behavior through two key methods:
 /// - `step()`: Determines the search direction at each iteration
 /// - `on_convergence()`: Handles termination when the search window collapses
-pub trait SearchStrategy<T: Ord> {
+pub trait SearchStrategy<T: Ord + std::fmt::Debug> {
     /// Determines how to adjust search bounds on each iteration.
     ///
     /// # Arguments
@@ -73,7 +74,8 @@ pub trait SearchStrategy<T: Ord> {
             if low == high {
                 return self.on_convergence(idx, cmp);
             }
-
+            #[cfg(debug_assertions)] println!("{}, {}, {}, {:?}, {:?}", idx, low, high, this_key, key);
+            #[cfg(debug_assertions)] println!("{:?}", self.step(idx, low, high, this_key.cmp(&key)));
             match self.step(idx, low, high, this_key.cmp(&key)) {
                 Bounds(l, h) => {
                     low = l;
@@ -111,7 +113,7 @@ impl Default for BinarySearch {
     }
 }
 
-impl<T: Ord> SearchStrategy<T> for BinarySearch {
+impl<T: Ord + std::fmt::Debug> SearchStrategy<T> for BinarySearch {
     fn step(
         &self,
         idx: usize,
@@ -166,7 +168,7 @@ impl Default for LowerPartitionSearch {
     }
 }
 
-impl<T: Ord> SearchStrategy<T> for LowerPartitionSearch {
+impl<T: Ord + std::fmt::Debug> SearchStrategy<T> for LowerPartitionSearch {
     fn step(&self, idx: usize, low: usize, high: usize, cmp: std::cmp::Ordering) -> SearchStatus {
         match cmp {
             Equal => Bounds(low, idx),
@@ -215,7 +217,7 @@ impl Default for UpperPartitionSearch {
     }
 }
 
-impl<T: Ord> SearchStrategy<T> for UpperPartitionSearch {
+impl<T: Ord + std::fmt::Debug> SearchStrategy<T> for UpperPartitionSearch {
     fn on_convergence(&self, idx: usize, cmp: std::cmp::Ordering) -> Option<usize> {
         match cmp {
             Greater => Some(idx),
@@ -226,6 +228,39 @@ impl<T: Ord> SearchStrategy<T> for UpperPartitionSearch {
     fn step(&self, idx: usize, low: usize, high: usize, cmp: std::cmp::Ordering) -> SearchStatus {
         match cmp {
             Equal => Bounds(idx + 1, high),
+            Less => Bounds(idx + 1, high),
+            Greater => {
+                if idx == low {
+                    Bounds(low, high - 1)
+                } else {
+                    Bounds(low, idx - 1)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct UniqueSearch;
+
+impl Default for UniqueSearch {
+    fn default() -> Self {
+        UniqueSearch {}
+    }
+}
+
+impl<T: Ord + std::fmt::Debug> SearchStrategy<T> for UniqueSearch {
+    fn on_convergence(&self, idx: usize, cmp: std::cmp::Ordering) -> Option<usize> {
+        match cmp {
+            Greater => Some(idx),
+            Equal => None,
+            Less => Some(idx + 1),
+        }
+    }
+
+    fn step(&self, idx: usize, low: usize, high: usize, cmp: std::cmp::Ordering) -> SearchStatus {
+        match cmp {
+            Equal => Bounds(idx, idx),
             Less => Bounds(idx + 1, high),
             Greater => {
                 if idx == low {
@@ -277,6 +312,20 @@ mod tests {
         assert_eq!(Some(4), strat.search(|i| *vec.get(i).unwrap(), 5, 0, 4));
         assert_eq!(Some(4), strat.search(|i| *vec.get(i).unwrap(), 6, 0, 4));
         assert_eq!(Some(5), strat.search(|i| *vec.get(i).unwrap(), 7, 0, 4));
+        assert_eq!(Some(5), strat.search(|i| *vec.get(i).unwrap(), 9, 0, 4));
+    }
+
+    #[test]
+    fn test_unique_search() {
+        let vec: Vec<i32> = vec![2, 5, 5, 5, 7];
+        let strat = UniqueSearch::default();
+
+        assert_eq!(Some(0), strat.search(|i| *vec.get(i).unwrap(), 0, 0, 4));
+        assert_eq!(None, strat.search(|i| *vec.get(i).unwrap(), 2, 0, 4));
+        assert_eq!(Some(1), strat.search(|i| *vec.get(i).unwrap(), 3, 0, 4));
+        assert_eq!(None, strat.search(|i| *vec.get(i).unwrap(), 5, 0, 4));
+        assert_eq!(Some(4), strat.search(|i| *vec.get(i).unwrap(), 6, 0, 4));
+        assert_eq!(None, strat.search(|i| *vec.get(i).unwrap(), 7, 0, 4));
         assert_eq!(Some(5), strat.search(|i| *vec.get(i).unwrap(), 9, 0, 4));
     }
 }

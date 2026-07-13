@@ -349,11 +349,6 @@ impl<R: std::fmt::Debug + DBReader> BTree<R> {
     }
 
     /// Delete a key from the B-Tree
-    ///
-    /// If this makes the page less than half full, then we need to check neighbors and maybe rearrange
-    /// if they have any we could steal.
-    ///
-    /// As a first step, I think we can just always merge with neighbor.
     pub fn delete(&self) {
         todo!()
     }
