@@ -17,6 +17,8 @@ pub enum PageError {
     PageTypeError(u32),
     #[error("Key already exists")]
     PrimaryKeyError(Vec<u8>),
+    #[error("Insert with idx `{0}` out of bounds with a page with `{1}` elements")]
+    IndexOutOfBounds(usize, usize),
 }
 
 pub enum HeaderElem {
@@ -92,6 +94,13 @@ enum SpaceStatus {
     OutOfSpace,
 }
 
+/// Locate tuple
+pub enum TupleLoc {
+    Index(usize),
+    Front,
+    Back,
+}
+
 /// Single shared representation for a slotted page and its ensuing operations
 #[repr(transparent)]
 pub struct SlottedPage([u8]);
@@ -165,7 +174,29 @@ impl SlottedPage {
         )
     }
 
-    pub fn tuple(&self, idx: usize) -> Option<&Tuple> {
+    /// Returns the back_index. Will be None if no items in page.
+    ///
+    /// Use `checked_sub` to try to subtract one. If nothing, then it returns None
+    fn back_index(&self) -> Option<usize> {
+        (self.get_header(&HeaderElem::ItemCount) as usize).checked_sub(1)
+    }
+
+    /// returns the front index. Will be None if no items are in the page
+    ///
+    /// Can use `then_some` on a boolean evaluator
+    fn front_index(&self) -> Option<usize> {
+        (self.get_header(&HeaderElem::ItemCount) > 0).then_some(0)
+    }
+
+    pub fn tuple(&self, loc: TupleLoc) -> Option<&Tuple> {
+        match loc {
+            TupleLoc::Index(idx) => self.tuple_at_index(idx),
+            TupleLoc::Front => self.tuple_at_index(self.front_index()?),
+            TupleLoc::Back => self.tuple_at_index(self.back_index()?),
+        }
+    }
+
+    fn tuple_at_index(&self, idx: usize) -> Option<&Tuple> {
         // Read first u16 / get size
         let ptr = if self.get_header(&HeaderElem::ItemCount) <= idx as u32 {
             None
@@ -183,7 +214,7 @@ impl SlottedPage {
             None
         } else {
             BinarySearch::default().search(
-                |idx| self.tuple(idx).unwrap().key().bytes(),
+                |idx| self.tuple(TupleLoc::Index(idx)).unwrap().key().bytes(),
                 key,
                 0,
                 count - 1,
@@ -198,7 +229,7 @@ impl SlottedPage {
         } else {
             UpperPartitionSearch::default()
                 .search(
-                    |idx| self.tuple(idx).unwrap().key().bytes(),
+                    |idx| self.tuple(TupleLoc::Index(idx)).unwrap().key().bytes(),
                     key,
                     0,
                     count - 1,
@@ -213,7 +244,7 @@ impl SlottedPage {
             Some(0)
         } else {
             UniqueSearch::default().search(
-                |idx| self.tuple(idx).unwrap().key().bytes(),
+                |idx| self.tuple(TupleLoc::Index(idx)).unwrap().key().bytes(),
                 key,
                 0,
                 count - 1,
@@ -228,7 +259,7 @@ impl SlottedPage {
         } else {
             LowerPartitionSearch::default()
                 .search(
-                    |idx| self.tuple(idx).unwrap().key().bytes(),
+                    |idx| self.tuple(TupleLoc::Index(idx)).unwrap().key().bytes(),
                     key,
                     0,
                     count - 1,
@@ -262,7 +293,7 @@ impl SlottedPage {
         }
     }
 
-    pub fn insert(&mut self, data: &Tuple) -> Result<(), PageError> {
+    fn insert_at_idx(&mut self, idx: usize, data: &Tuple) -> Result<(), PageError> {
         // We need to check how much space we have.
         match self.check_space(data.len() + 2usize) {
             SpaceStatus::Ok => {}
@@ -270,22 +301,40 @@ impl SlottedPage {
             SpaceStatus::OutOfSpace => return Err(PageError::OutOfSpace),
         }
 
-        // Get slot write ptr and tuple write ptr
-        let tuple_write_ptr = self.get_header(&HeaderElem::FreeSpacePtr) as usize - data.len();
-        let slot_write_idx = self
-            .find_insert_idx(data.key().bytes())
-            .ok_or(PageError::PrimaryKeyError(data.key().bytes().into()))?;
+        // Check we aren't out of bounds of insert
+        let count = self.get_header(&HeaderElem::ItemCount) as usize;
+        if idx > count {
+            return Err(PageError::IndexOutOfBounds(idx, count));
+        }
 
-        // I think the safest order is probably write out Tuple, then Slot, then update headers?
-        // Write first
-        // let mut_content = self.content_mut();
+        let tuple_write_ptr = self.get_header(&HeaderElem::FreeSpacePtr) as usize - data.len();
         self.0[tuple_write_ptr..tuple_write_ptr + data.len()].copy_from_slice(&data.0);
-        self.insert_slot_at(slot_write_idx, tuple_write_ptr.try_into().unwrap());
+        self.insert_slot_at(idx, tuple_write_ptr.try_into().unwrap());
 
         // Update header
         self.update_header_insert(data.size().into());
 
         Ok(())
+    }
+
+    pub fn insert(&mut self, data: &Tuple) -> Result<(), PageError> {
+        let slot_write_idx = self
+            .find_insert_idx(data.key().bytes())
+            .ok_or(PageError::PrimaryKeyError(data.key().bytes().into()))?;
+
+        self.insert_at_idx(slot_write_idx, data)
+    }
+
+    pub fn push(&mut self, loc: TupleLoc, data: &Tuple) -> Result<(), PageError> {
+        match loc {
+            TupleLoc::Index(idx) => self.insert_at_idx(idx, data),
+            TupleLoc::Back => self.insert_at_idx(self.back_index().unwrap_or(0), data),
+            TupleLoc::Front => self.insert_at_idx(self.front_index().unwrap_or(0), data),
+        }
+    }
+
+    pub fn size_at(&mut self, loc: TupleLoc) -> Option<usize> {
+        Some(self.tuple(loc)?.size() as usize)
     }
 
     fn update_header_insert(&mut self, insert_size: i64) {
@@ -331,7 +380,7 @@ impl SlottedPage {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on successful deletion, or `KeyNotFound` if the key does not exist.
+    /// Returns `Ok(TupleBuf)` on successful deletion, or `KeyNotFound` if the key does not exist.
     ///
     /// # Behavior
     ///
@@ -340,13 +389,14 @@ impl SlottedPage {
     ///   and its 2-byte slot.
     /// - Leaves the tuple data and any gaps in memory (fragmentation). Use [`collapse`](Self::collapse)
     ///   to reclaim fragmented space.
-    pub fn delete(&mut self, key: &[u8]) -> Result<(), PageError> {
+    pub fn delete(&mut self, key: &[u8]) -> Result<TupleBuf, PageError> {
         let delete_idx = self
             .find_key(key)
             .ok_or(PageError::KeyNotFound(key.into()))?;
 
         // Get size of tuple to mark the free space
-        let tuple_size = self.tuple(delete_idx).unwrap().size();
+        let tuple = self.tuple(TupleLoc::Index(delete_idx)).unwrap().to_owned();
+        let tuple_size = tuple.size();
 
         // Move everything over to cover now deleted key.
         // The `end_ptr` maps from current item count to copy end.
@@ -362,7 +412,7 @@ impl SlottedPage {
         self.update_header(&HeaderElem::ItemCount, -1);
         self.update_header(&HeaderElem::TotalFreeSpace, -(tuple_size as i64 + 2));
 
-        Ok(())
+        Ok(tuple)
     }
 
     /// Cleans up the page, only keeping the first 0..split_idx items in the page
@@ -379,7 +429,8 @@ impl SlottedPage {
             self.get_header(&HeaderElem::LeftChildPtr),
         );
         for idx in 0..split_idx {
-            temp.insert(self.tuple(idx).unwrap()).unwrap();
+            temp.insert(self.tuple(TupleLoc::Index(idx)).unwrap())
+                .unwrap();
         }
         self.0.copy_from_slice(&temp.0[0..PAGE_SIZE]);
     }
@@ -401,16 +452,21 @@ impl SlottedPage {
         let (split_idx, middle_tuple) = match key_loc.cmp(&middle_idx) {
             std::cmp::Ordering::Less => (
                 middle_idx - 1,
-                self.tuple(middle_idx - 1).unwrap().to_owned(),
+                self.tuple(TupleLoc::Index(middle_idx - 1))
+                    .unwrap()
+                    .to_owned(),
             ),
             std::cmp::Ordering::Equal => (middle_idx, tuple.to_owned()),
-            std::cmp::Ordering::Greater => (middle_idx, self.tuple(middle_idx).unwrap().to_owned()),
+            std::cmp::Ordering::Greater => (
+                middle_idx,
+                self.tuple(TupleLoc::Index(middle_idx)).unwrap().to_owned(),
+            ),
         };
 
         // Grab tuples that will go right
         let mut tuples: Vec<TupleBuf> = Vec::with_capacity(item_count - split_idx - 1);
         for idx in split_idx..(item_count - 1) {
-            tuples.push(self.tuple(idx).unwrap().to_owned());
+            tuples.push(self.tuple(TupleLoc::Index(idx)).unwrap().to_owned());
         }
 
         // Only keep left side of the page
@@ -493,7 +549,7 @@ impl InnerNode {
         } else {
             u32::from_be_bytes(
                 self.0
-                    .tuple(found_idx - 1)
+                    .tuple(TupleLoc::Index(found_idx - 1))
                     .unwrap()
                     .value()
                     .try_into()
@@ -569,7 +625,7 @@ mod tests {
 
         // check that we are in order
         for i in 0..100usize {
-            let t = page.tuple(i).unwrap();
+            let t = page.tuple(TupleLoc::Index(i)).unwrap();
             let k = u32::from_be_bytes(t.key().bytes().try_into().unwrap());
             assert_eq!(i, k as usize)
         }

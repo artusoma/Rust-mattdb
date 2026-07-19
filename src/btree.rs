@@ -1,6 +1,6 @@
 use crate::buffer_pool::{BufferPool, ObjectID, PageID, PageRef};
 use crate::representations::page::{
-    HeaderElem, InnerNode, Leaf, NULL_PTR, PageError, PageType, SlottedPage,
+    HeaderElem, InnerNode, Leaf, NULL_PTR, PageError, PageType, SlottedPage, TupleLoc
 };
 use crate::representations::tuple::{Tuple, TupleBuf};
 use crate::storage::DBReader;
@@ -77,7 +77,7 @@ impl<'a, R: DBReader> std::iter::Iterator for ScanIterator<'a, R> {
         let leaf = Leaf::from_bytes(&lock);
 
         // Get next pair. Check key to see if we are at end.
-        let t = leaf.tuple(self.idx).unwrap();
+        let t = leaf.tuple(TupleLoc::Index(self.idx)).unwrap();
         self.idx += 1;
         if t.key().bytes() > self.end_key {
             None
@@ -255,8 +255,8 @@ impl<R: std::fmt::Debug + DBReader> BTree<R> {
                 let (middle_tuple, right_tuples) = left_page_repr.split_half(tuple);
 
                 // Init sibling page
-                // The new left child ptr needs to be the page that the promoted
-                // middle key used to point to
+                // The new left child ptr needs to be the page 
+                // that the promoted middle key used to point to
                 right_page_repr.init(
                     new_sibling_id,
                     page.id(),
@@ -349,7 +349,54 @@ impl<R: std::fmt::Debug + DBReader> BTree<R> {
     }
 
     /// Delete a key from the B-Tree
-    pub fn delete(&self) {
+    // pub fn delete(&self, object_id: ObjectID, key: &[u8]) -> Result<(), PageError> {
+    //     /*
+    //     1. Check if the leaf is fat, if so, delete. We are done! Thank you!
+    //     2. Ok, not enough space.
+    //         1. Check right-most neighbor. Is he fat?
+    //             1. If yes, 
+    //     */
+    //     let root_id = self.pool.get_object_root(object_id);
+    //     let (leaf, parents) = self.traverse_to_leaf(
+    //         self.pool.get_page_ref(root_id).unwrap(),
+    //         key,
+    //         Vec::new(),
+    //     );
+
+    //     // Delete the key
+    //     let mut page_lock = leaf.write().unwrap();
+    //     let leaf = Leaf::from_bytes_mut(&mut page_lock);
+    //     let _ = leaf.delete(key)?;
+
+    //     // If still full enough, return Ok
+    //     if leaf.percent_full() > 50 {
+    //         return Ok(())
+    //     }
+
+    //     // Otherwise, check right sibling
+    //     let right_sibling = leaf.get_header(&HeaderElem::RightSiblingPtr);
+
+    //     if right_sibling != NULL_PTR {
+    //         let right_sibling_page = self.pool.get_page_ref(right_sibling).unwrap();
+    //         let mut sibling_lock = right_sibling_page.write().unwrap();
+    //         let sibling = Leaf::from_bytes_mut(&mut sibling_lock);
+
+    //         if leaf.percent_full() + sibling.percent_full() < 100 {
+    //             // do a merge
+    //             todo!()
+    //         } else {
+    //             while leaf.percent_full() < 50 {
+    //                 let move_tuple = sibling.delete(0)?;
+    //                 leaf.insert(&move_tuple);
+    //             }
+    //         }
+
+    //     }
+
+    //     Ok(())
+    // }
+
+    pub fn bulk_insert(&self) {
         todo!()
     }
 }
